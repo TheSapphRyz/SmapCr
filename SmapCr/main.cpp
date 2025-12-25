@@ -13,6 +13,7 @@
 #include <cstring>
 
 using json = nlohmann::json;
+
 const int TILE_SIZE = 64;
 const int JSON_BUFFER_SIZE = 4096;
 const float CIRCLE_RADIUS = 15.0f;
@@ -37,7 +38,7 @@ int selectedEntityIdx = -1;
 int activeTextureIdx = 0;
 bool isIsometric = false;
 bool snapToGrid = true;
-int currentTool = 0; // 0: Tile, 1: Object (Circle), 2: Select
+int currentTool = 0;
 char jsonEditBuffer[JSON_BUFFER_SIZE] = "{}";
 int mapWidth = 50;
 int mapHeight = 50;
@@ -59,6 +60,7 @@ Vector2 IsoToWorld(Vector2 isoPos) {
     float worldY = (2.0f * isoPos.y - isoPos.x) * 0.5f;
     return { worldX, worldY };
 }
+
 void SaveMap(const std::string& path) {
     json j;
     j["mapInfo"]["width"] = mapWidth;
@@ -83,8 +85,7 @@ void SaveMap(const std::string& path) {
             {"isTile", ent.isTile},
             {"size", {ent.size.x, ent.size.y}},
             {"circleColor", {ent.circleColor.r, ent.circleColor.g, ent.circleColor.b, ent.circleColor.a}},
-            {"properties", props},
-            {"json", ent.jsonProperties}
+            {"properties", props}
         };
         entitiesArray.push_back(entityJson);
     }
@@ -171,7 +172,13 @@ bool IsMouseOverUI(Vector2 mousePos) {
 }
 
 int main() {
-    InitWindow(1280, 720, "Map Editor 2025 - Circles & JSON");
+    static char widthText[10] = "50";
+    static char heightText[10] = "50";
+    static bool widthEditMode = false;
+    static bool heightEditMode = false;
+    static int editMapWidth = mapWidth;
+    static int editMapHeight = mapHeight;
+    InitWindow(1920, 1080, "SmapCr: ALpha");
     SetTargetFPS(60);
     NFD_Init();
 
@@ -190,29 +197,74 @@ int main() {
         UnloadImage(placeholderImg);
     }
 
+    static char toolNames[3][32] = { "Tile Brush", "Circle Object", "Select/Edit" };
+
     while (!WindowShouldClose()) {
         BeginDrawing();
         ClearBackground({ 30, 30, 35, 255 });
 
         if (currentState == STATE_MENU) {
             DrawText("Map Editor", 550, 100, 40, WHITE);
+
             GuiWindowBox({ 490, 150, 300, 200 }, "New Map Settings");
+
             GuiLabel({ 500, 180, 80, 20 }, "Width (tiles):");
-            GuiValueBox({ 650, 180, 120, 20 }, NULL, &mapWidth, 1, 500, true);
+            static char widthText[10] = "50";
+            static bool widthEditMode = false;
+
+            Rectangle widthBox = { 650, 180, 120, 20 };
+            if (GuiTextBox(widthBox, widthText, 10, widthEditMode)) {
+                widthEditMode = !widthEditMode;
+            }
+
+            int tempWidth = atoi(widthText);
+            if (tempWidth < 1) {
+                tempWidth = 1;
+                snprintf(widthText, 10, "%d", tempWidth);
+            }
+            if (tempWidth > 500) {
+                tempWidth = 500;
+                snprintf(widthText, 10, "%d", tempWidth);
+            }
+            mapWidth = tempWidth;
+
             GuiLabel({ 500, 210, 80, 20 }, "Height (tiles):");
-            GuiValueBox({ 650, 210, 120, 20 }, NULL, &mapHeight, 1, 500, true);
+            static char heightText[10] = "50";
+            static bool heightEditMode = false;
+
+            Rectangle heightBox = { 650, 210, 120, 20 };
+            if (GuiTextBox(heightBox, heightText, 10, heightEditMode)) {
+                heightEditMode = !heightEditMode;
+            }
+
+            int tempHeight = atoi(heightText);
+            if (tempHeight < 1) {
+                tempHeight = 1;
+                snprintf(heightText, 10, "%d", tempHeight);
+            }
+            if (tempHeight > 500) {
+                tempHeight = 500;
+                snprintf(heightText, 10, "%d", tempHeight);
+            }
+            mapHeight = tempHeight;
+
             if (GuiButton({ 540, 280, 200, 40 }, "Create New Map")) {
                 entities.clear();
                 selectedEntityIdx = -1;
                 showJsonEditor = false;
                 currentState = STATE_EDITOR;
             }
+
             if (GuiButton({ 540, 350, 200, 40 }, "Open Map")) {
                 nfdchar_t* outPath = nullptr;
                 nfdresult_t result = NFD_OpenDialog(&outPath, NULL, 0, NULL);
                 if (result == NFD_OKAY) {
                     LoadMap(outPath);
                     NFD_FreePath(outPath);
+
+                    snprintf(widthText, 10, "%d", mapWidth);
+                    snprintf(heightText, 10, "%d", mapHeight);
+
                     selectedEntityIdx = -1;
                     showJsonEditor = false;
                     currentState = STATE_EDITOR;
@@ -222,6 +274,7 @@ int main() {
         else {
             Vector2 mousePos = GetMousePosition();
             bool mouseOverUI = IsMouseOverUI(mousePos);
+
             if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
                 Vector2 delta = GetMouseDelta();
                 camera.target = Vector2Subtract(camera.target, Vector2Scale(delta, 1.0f / camera.zoom));
@@ -238,8 +291,10 @@ int main() {
                 camera.target = Vector2Add(camera.target,
                     Vector2Subtract(mouseWorldBefore, mouseWorldAfter));
             }
-            if (!mouseOverUI) {
+
+            if (!mouseOverUI && !isEditingJson) {
                 Vector2 mouseWorld = GetScreenToWorld2D(mousePos, camera);
+
                 Vector2 gridPos;
                 if (isIsometric) {
                     gridPos = IsoToWorld(mouseWorld);
@@ -247,21 +302,19 @@ int main() {
                 else {
                     gridPos = mouseWorld;
                 }
-                int gridX = (int)(gridPos.x / TILE_SIZE);
-                int gridY = (int)(gridPos.y / TILE_SIZE);
 
-                if (gridX >= 0 && gridX < mapWidth && gridY >= 0 && gridY < mapHeight) {
-                    Vector2 tilePos = { (float)gridX * TILE_SIZE, (float)gridY * TILE_SIZE };
-                    Vector2 circlePos = { tilePos.x + TILE_SIZE / 2.0f, tilePos.y + TILE_SIZE / 2.0f };
+                if (gridPos.x >= 0 && gridPos.x < mapWidth * TILE_SIZE &&
+                    gridPos.y >= 0 && gridPos.y < mapHeight * TILE_SIZE) {
 
                     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-                        if (currentTool == 2) { 
+                        if (currentTool == 2) {
                             selectedEntityIdx = -1;
                             float closestDist = CIRCLE_RADIUS * 2.0f;
-                            Vector2 searchPos = isIsometric ? gridPos : mouseWorld;
 
                             for (int i = (int)entities.size() - 1; i >= 0; i--) {
                                 if (entities[i].isTile) {
+                                    int gridX = (int)(gridPos.x / TILE_SIZE);
+                                    int gridY = (int)(gridPos.y / TILE_SIZE);
                                     Vector2 entityGridPos = {
                                         entities[i].worldPos.x / TILE_SIZE,
                                         entities[i].worldPos.y / TILE_SIZE
@@ -275,7 +328,9 @@ int main() {
                                     }
                                 }
                                 else {
-                                    float dist = Vector2Distance(searchPos, entities[i].worldPos);
+                                    Vector2 entityPos = entities[i].worldPos;
+                                    Vector2 searchPos = isIsometric ? gridPos : mouseWorld;
+                                    float dist = Vector2Distance(searchPos, entityPos);
                                     if (dist < CIRCLE_RADIUS && dist < closestDist) {
                                         selectedEntityIdx = i;
                                         closestDist = dist;
@@ -287,46 +342,55 @@ int main() {
                             }
                         }
                         else if (currentTool == 0) {
-                            bool tileExists = false;
-                            int existingTileIdx = -1;
+                            int gridX = (int)(gridPos.x / TILE_SIZE);
+                            int gridY = (int)(gridPos.y / TILE_SIZE);
 
-                            for (int i = 0; i < (int)entities.size(); i++) {
-                                if (entities[i].isTile) {
-                                    Vector2 entityGridPos = {
-                                        entities[i].worldPos.x / TILE_SIZE,
-                                        entities[i].worldPos.y / TILE_SIZE
-                                    };
+                            if (gridX >= 0 && gridX < mapWidth && gridY >= 0 && gridY < mapHeight) {
+                                Vector2 tilePos = { (float)gridX * TILE_SIZE, (float)gridY * TILE_SIZE };
 
-                                    if ((int)entityGridPos.x == gridX && (int)entityGridPos.y == gridY) {
-                                        tileExists = true;
-                                        existingTileIdx = i;
-                                        break;
+                                bool tileExists = false;
+                                int existingTileIdx = -1;
+
+                                for (int i = 0; i < (int)entities.size(); i++) {
+                                    if (entities[i].isTile) {
+                                        Vector2 entityGridPos = {
+                                            entities[i].worldPos.x / TILE_SIZE,
+                                            entities[i].worldPos.y / TILE_SIZE
+                                        };
+
+                                        if ((int)entityGridPos.x == gridX && (int)entityGridPos.y == gridY) {
+                                            tileExists = true;
+                                            existingTileIdx = i;
+                                            break;
+                                        }
                                     }
                                 }
-                            }
 
-                            if (tileExists) {
-                                entities[existingTileIdx].textureId = activeTextureIdx;
-                                selectedEntityIdx = existingTileIdx;
-                                strncpy(jsonEditBuffer, entities[existingTileIdx].jsonProperties.c_str(), JSON_BUFFER_SIZE - 1);
-                                showJsonEditor = true;
-                            }
-                            else {
-                                MapEntity newEnt = {
-                                    activeTextureIdx,
-                                    tilePos,
-                                    { (float)TILE_SIZE, (float)TILE_SIZE },
-                                    true,
-                                    "{}",
-                                    WHITE
-                                };
-                                entities.push_back(newEnt);
+                                if (tileExists) {
+                                    entities[existingTileIdx].textureId = activeTextureIdx;
+                                    selectedEntityIdx = existingTileIdx;
+                                    strncpy(jsonEditBuffer, entities[existingTileIdx].jsonProperties.c_str(), JSON_BUFFER_SIZE - 1);
+                                    showJsonEditor = true;
+                                }
+                                else {
+                                    MapEntity newEnt = {
+                                        activeTextureIdx,
+                                        tilePos,
+                                        { (float)TILE_SIZE, (float)TILE_SIZE },
+                                        true,
+                                        "{}",
+                                        WHITE
+                                    };
+                                    entities.push_back(newEnt);
+                                }
                             }
                         }
-                        else if (currentTool == 1) { 
+                        else if (currentTool == 1) {
+                            Vector2 objectPos = isIsometric ? gridPos : mouseWorld;
+
                             MapEntity newEnt = {
                                 activeTextureIdx,
-                                circlePos,
+                                objectPos,
                                 { CIRCLE_RADIUS * 2.0f, CIRCLE_RADIUS * 2.0f },
                                 false,
                                 "{}",
@@ -339,17 +403,18 @@ int main() {
                             showJsonEditor = true;
                         }
                     }
+
                     if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && selectedEntityIdx != -1 &&
                         !entities[selectedEntityIdx].isTile && currentTool == 2) {
 
-                        if (snapToGrid) {
-                            entities[selectedEntityIdx].worldPos = circlePos;
-                        }
-                        else {
-                            entities[selectedEntityIdx].worldPos = isIsometric ? gridPos : mouseWorld;
-                        }
+                        Vector2 newPos = isIsometric ? gridPos : mouseWorld;
+                        entities[selectedEntityIdx].worldPos = newPos;
                     }
+
                     if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && currentTool == 0) {
+                        int gridX = (int)(gridPos.x / TILE_SIZE);
+                        int gridY = (int)(gridPos.y / TILE_SIZE);
+
                         for (int i = (int)entities.size() - 1; i >= 0; i--) {
                             if (entities[i].isTile) {
                                 Vector2 entityGridPos = {
@@ -373,11 +438,13 @@ int main() {
                     }
                 }
             }
+
             if (IsKeyPressed(KEY_DELETE) && selectedEntityIdx != -1) {
                 entities.erase(entities.begin() + selectedEntityIdx);
                 selectedEntityIdx = -1;
                 showJsonEditor = false;
             }
+
             BeginMode2D(camera);
             {
                 if (isIsometric) {
@@ -385,14 +452,17 @@ int main() {
                         for (int x = 0; x < mapWidth; x++) {
                             Vector2 worldPos = { (float)x * TILE_SIZE, (float)y * TILE_SIZE };
                             Vector2 isoPos = WorldToIso(worldPos);
+
                             Vector2 points[4] = {
                                 { isoPos.x, isoPos.y - TILE_SIZE / 2 },
                                 { isoPos.x + TILE_SIZE / 2, isoPos.y },
                                 { isoPos.x, isoPos.y + TILE_SIZE / 2 },
                                 { isoPos.x - TILE_SIZE / 2, isoPos.y }
                             };
+
                             DrawTriangle(points[0], points[1], points[2], ColorAlpha(DARKGRAY, 0.3f));
                             DrawTriangle(points[0], points[2], points[3], ColorAlpha(DARKGRAY, 0.3f));
+
                             DrawLineV(points[0], points[1], DARKGRAY);
                             DrawLineV(points[1], points[2], DARKGRAY);
                             DrawLineV(points[2], points[3], DARKGRAY);
@@ -410,6 +480,7 @@ int main() {
                         DrawLine(0, i * TILE_SIZE, mapWidth * TILE_SIZE, i * TILE_SIZE, DARKGRAY);
                     }
                 }
+
                 for (int i = 0; i < (int)entities.size(); i++) {
                     Vector2 drawPos = entities[i].worldPos;
 
@@ -451,6 +522,10 @@ int main() {
                         }
                     }
                     else {
+                        if (isIsometric) {
+                            drawPos = WorldToIso(drawPos);
+                        }
+
                         Color drawColor = entities[i].circleColor;
                         if (i == selectedEntityIdx) {
                             drawColor = ColorAlpha(RED, 0.7f);
@@ -461,8 +536,10 @@ int main() {
                         DrawCircleV(drawPos, 3.0f, WHITE);
                     }
                 }
+
                 if (!mouseOverUI && currentTool != 2) {
                     Vector2 mouseWorld = GetScreenToWorld2D(mousePos, camera);
+
                     Vector2 gridPos;
                     if (isIsometric) {
                         gridPos = IsoToWorld(mouseWorld);
@@ -471,102 +548,92 @@ int main() {
                         gridPos = mouseWorld;
                     }
 
-                    int gridX = (int)(gridPos.x / TILE_SIZE);
-                    int gridY = (int)(gridPos.y / TILE_SIZE);
-
-                    if (gridX >= 0 && gridX < mapWidth && gridY >= 0 && gridY < mapHeight) {
-                        Vector2 tilePos = { (float)gridX * TILE_SIZE, (float)gridY * TILE_SIZE };
-                        Vector2 circlePos = { tilePos.x + TILE_SIZE / 2.0f, tilePos.y + TILE_SIZE / 2.0f };
-
-                        Vector2 previewPos = tilePos;
-                        if (isIsometric && currentTool == 0) {
-                            previewPos = WorldToIso(tilePos);
-                        }
-                        else if (isIsometric && currentTool == 1) {
-                            previewPos = WorldToIso(circlePos);
-                        }
+                    if (gridPos.x >= 0 && gridPos.x < mapWidth * TILE_SIZE &&
+                        gridPos.y >= 0 && gridPos.y < mapHeight * TILE_SIZE) {
 
                         if (currentTool == 0) {
-                            if (activeTextureIdx >= 0 && activeTextureIdx < (int)assetLibrary.size()) {
+                            int gridX = (int)(gridPos.x / TILE_SIZE);
+                            int gridY = (int)(gridPos.y / TILE_SIZE);
+
+                            if (gridX >= 0 && gridX < mapWidth && gridY >= 0 && gridY < mapHeight) {
+                                Vector2 tilePos = { (float)gridX * TILE_SIZE, (float)gridY * TILE_SIZE };
+
+                                Vector2 previewPos = tilePos;
                                 if (isIsometric) {
-                                    Rectangle source = { 0, 0, (float)assetLibrary[activeTextureIdx].texture.width,
-                                                       (float)assetLibrary[activeTextureIdx].texture.height };
-                                    Rectangle dest = { previewPos.x, previewPos.y, (float)TILE_SIZE, (float)TILE_SIZE };
-                                    Vector2 origin = { (float)TILE_SIZE / 2, (float)TILE_SIZE / 2 };
-                                    DrawTexturePro(assetLibrary[activeTextureIdx].texture, source, dest, origin, 0.0f, ColorAlpha(WHITE, 0.5f));
+                                    previewPos = WorldToIso(tilePos);
+                                }
+
+                                if (activeTextureIdx >= 0 && activeTextureIdx < (int)assetLibrary.size()) {
+                                    if (isIsometric) {
+                                        Rectangle source = { 0, 0, (float)assetLibrary[activeTextureIdx].texture.width,
+                                                           (float)assetLibrary[activeTextureIdx].texture.height };
+                                        Rectangle dest = { previewPos.x, previewPos.y, (float)TILE_SIZE, (float)TILE_SIZE };
+                                        Vector2 origin = { (float)TILE_SIZE / 2, (float)TILE_SIZE / 2 };
+                                        DrawTexturePro(assetLibrary[activeTextureIdx].texture, source, dest, origin, 0.0f, ColorAlpha(WHITE, 0.5f));
+                                    }
+                                    else {
+                                        DrawTextureV(assetLibrary[activeTextureIdx].texture, previewPos, ColorAlpha(WHITE, 0.5f));
+                                    }
+                                }
+
+                                if (isIsometric) {
+                                    Vector2 points[4] = {
+                                        { previewPos.x, previewPos.y - TILE_SIZE / 2 },
+                                        { previewPos.x + TILE_SIZE / 2, previewPos.y },
+                                        { previewPos.x, previewPos.y + TILE_SIZE / 2 },
+                                        { previewPos.x - TILE_SIZE / 2, previewPos.y }
+                                    };
+                                    DrawLineV(points[0], points[1], ColorAlpha(GREEN, 0.7f));
+                                    DrawLineV(points[1], points[2], ColorAlpha(GREEN, 0.7f));
+                                    DrawLineV(points[2], points[3], ColorAlpha(GREEN, 0.7f));
+                                    DrawLineV(points[3], points[0], ColorAlpha(GREEN, 0.7f));
                                 }
                                 else {
-                                    DrawTextureV(assetLibrary[activeTextureIdx].texture, previewPos, ColorAlpha(WHITE, 0.5f));
+                                    DrawRectangleLinesEx({ previewPos.x, previewPos.y, (float)TILE_SIZE, (float)TILE_SIZE },
+                                        2.0f, ColorAlpha(GREEN, 0.7f));
                                 }
-                            }
-
-                            if (isIsometric) {
-                                Vector2 points[4] = {
-                                    { previewPos.x, previewPos.y - TILE_SIZE / 2 },
-                                    { previewPos.x + TILE_SIZE / 2, previewPos.y },
-                                    { previewPos.x, previewPos.y + TILE_SIZE / 2 },
-                                    { previewPos.x - TILE_SIZE / 2, previewPos.y }
-                                };
-                                DrawLineV(points[0], points[1], ColorAlpha(GREEN, 0.7f));
-                                DrawLineV(points[1], points[2], ColorAlpha(GREEN, 0.7f));
-                                DrawLineV(points[2], points[3], ColorAlpha(GREEN, 0.7f));
-                                DrawLineV(points[3], points[0], ColorAlpha(GREEN, 0.7f));
-                            }
-                            else {
-                                DrawRectangleLinesEx({ previewPos.x, previewPos.y, (float)TILE_SIZE, (float)TILE_SIZE },
-                                    2.0f, ColorAlpha(GREEN, 0.7f));
                             }
                         }
                         else if (currentTool == 1) {
-                            Vector2 drawPos = isIsometric ? WorldToIso(circlePos) : circlePos;
+                            Vector2 drawPos = isIsometric ? WorldToIso(gridPos) : mouseWorld;
                             DrawCircleLinesV(drawPos, CIRCLE_RADIUS, ColorAlpha(GREEN, 0.7f));
                         }
                     }
                 }
             }
             EndMode2D();
+
             GuiWindowBox({ 10, 10, 250, 450 }, "Toolbar");
+
             GuiLabel({ 20, 40, 100, 20 }, "Tools:");
-            static bool toolButtons[3] = { false, false, false };
-            if (GuiToggle({ 20, 65, 230, 25 }, "Tile Brush", &toolButtons[0])) {
-                if (toolButtons[0]) {
-                    currentTool = 0;
-                    toolButtons[1] = false;
-                    toolButtons[2] = false;
-                }
+
+            if (GuiButton({ 20, 65, 230, 25 }, toolNames[0])) {
+                currentTool = 0;
+            }
+            if (GuiButton({ 20, 95, 230, 25 }, toolNames[1])) {
+                currentTool = 1;
+            }
+            if (GuiButton({ 20, 125, 230, 25 }, toolNames[2])) {
+                currentTool = 2;
             }
 
-            if (GuiToggle({ 20, 95, 230, 25 }, "Circle Object", &toolButtons[1])) {
-                if (toolButtons[1]) {
-                    currentTool = 1;
-                    toolButtons[0] = false;
-                    toolButtons[2] = false;
-                }
+            Color highlightColor = { 100, 100, 150, 255 };
+            Rectangle highlightRect;
+            switch (currentTool) {
+            case 0: highlightRect = { 20, 65, 230, 25 }; break;
+            case 1: highlightRect = { 20, 95, 230, 25 }; break;
+            case 2: highlightRect = { 20, 125, 230, 25 }; break;
             }
+            DrawRectangleLinesEx(highlightRect, 2, highlightColor);
 
-            if (GuiToggle({ 20, 125, 230, 25 }, "Select/Edit", &toolButtons[2])) {
-                if (toolButtons[2]) {
-                    currentTool = 2;
-                    toolButtons[0] = false;
-                    toolButtons[1] = false;
-                }
-            }
-            toolButtons[0] = (currentTool == 0);
-            toolButtons[1] = (currentTool == 1);
-            toolButtons[2] = (currentTool == 2);
-            const char* toolNames[] = { "Tile Brush", "Circle Object", "Select/Edit" };
             GuiLabel({ 20, 160, 230, 20 }, TextFormat("Current: %s", toolNames[currentTool]));
-            bool tempIsometric = isIsometric;
-            if (GuiCheckBox({ 20, 185, 20, 20 }, NULL, &tempIsometric)) {
-                isIsometric = tempIsometric;
-            }
+
+            isIsometric = GuiCheckBox({ 20, 185, 20, 20 }, NULL, &isIsometric);
             GuiLabel({ 45, 185, 200, 20 }, "Isometric View");
 
-            bool tempSnapToGrid = snapToGrid;
-            if (GuiCheckBox({ 20, 210, 20, 20 }, NULL, &tempSnapToGrid)) {
-                snapToGrid = tempSnapToGrid;
-            }
+            snapToGrid = GuiCheckBox({ 20, 210, 20, 20 }, NULL, &snapToGrid);
             GuiLabel({ 45, 210, 200, 20 }, "Snap to Grid");
+
             GuiLabel({ 20, 240, 100, 20 }, "Active Texture:");
             if (activeTextureIdx >= 0 && activeTextureIdx < (int)assetLibrary.size()) {
                 GuiLabel({ 120, 240, 130, 20 }, assetLibrary[activeTextureIdx].name.c_str());
@@ -580,6 +647,7 @@ int main() {
                 if (activeTextureIdx < (int)assetLibrary.size() - 1) activeTextureIdx++;
                 else activeTextureIdx = 0;
             }
+
             if (GuiButton({ 20, 300, 230, 25 }, "Load Texture")) {
                 nfdchar_t* outPath = nullptr;
                 nfdresult_t result = NFD_OpenDialog(&outPath, NULL, 0, NULL);
@@ -603,12 +671,14 @@ int main() {
                 selectedEntityIdx = -1;
                 showJsonEditor = false;
             }
+
             GuiLabel({ 20, 390, 230, 20 }, TextFormat("Entities: %d", (int)entities.size()));
             if (selectedEntityIdx != -1) {
                 GuiLabel({ 20, 410, 230, 20 }, TextFormat("Selected: %d", selectedEntityIdx));
                 GuiLabel({ 20, 430, 230, 20 }, TextFormat("Type: %s",
                     entities[selectedEntityIdx].isTile ? "Tile" : "Circle"));
             }
+
             GuiWindowBox({ (float)GetScreenWidth() - 260, 10, 250, 300 }, "Asset Library");
             for (int i = 0; i < (int)assetLibrary.size(); i++) {
                 Rectangle btnRect = { (float)GetScreenWidth() - 250, 40.0f + i * 55, 230, 50 };
@@ -620,6 +690,7 @@ int main() {
                     DrawRectangleLinesEx(btnRect, 2, GREEN);
                 }
             }
+
             if (showJsonEditor && selectedEntityIdx != -1) {
                 GuiWindowBox({ (float)GetScreenWidth() - 260, 320, 250, 300 },
                     entities[selectedEntityIdx].isTile ? "Tile Inspector" : "Circle Inspector");
@@ -668,6 +739,7 @@ int main() {
                     if (GuiButton({ (float)GetScreenWidth() - 250, 510, 230, 25 }, "Edit JSON")) {
                         isEditingJson = true;
                     }
+
                     if (GuiButton({ (float)GetScreenWidth() - 250, 540, 110, 30 }, "Delete")) {
                         entities.erase(entities.begin() + selectedEntityIdx);
                         selectedEntityIdx = -1;
@@ -695,6 +767,7 @@ int main() {
                     if (GuiButton({ (float)GetScreenWidth() - 250, 450, 230, 25 }, "Edit JSON")) {
                         isEditingJson = true;
                     }
+
                     if (GuiButton({ (float)GetScreenWidth() - 250, 480, 110, 30 }, "Delete")) {
                         entities.erase(entities.begin() + selectedEntityIdx);
                         selectedEntityIdx = -1;
@@ -707,6 +780,7 @@ int main() {
                         isEditingJson = false;
                     }
                 }
+
                 if (isEditingJson) {
                     int result = GuiTextInputBox(
                         { (float)GetScreenWidth() / 2 - 200, (float)GetScreenHeight() / 2 - 150, 400, 300 },
@@ -718,7 +792,7 @@ int main() {
                         nullptr
                     );
 
-                    if (result == 1) { 
+                    if (result == 1) {
                         try {
                             json test = json::parse(jsonEditBuffer);
                             entities[selectedEntityIdx].jsonProperties = jsonEditBuffer;
@@ -729,11 +803,12 @@ int main() {
                         }
                         isEditingJson = false;
                     }
-                    else if (result == 0) { 
+                    else if (result == 0) {
                         isEditingJson = false;
                     }
                 }
             }
+
             DrawText("LMB: Place/Select | RMB: Move Camera/Delete Tiles | DEL: Delete Selected",
                 10, GetScreenHeight() - 30, 10, LIGHTGRAY);
         }
