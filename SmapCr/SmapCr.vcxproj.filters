@@ -52,6 +52,9 @@
     <ClInclude Include="..\..\..\..\Downloads\json.hpp">
       <Filter>Файлы заголовков</Filter>
     </ClInclude>
+    <ClInclude Include="vec.hpp">
+      <Filter>Файлы заголовков</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="sho.txt" />

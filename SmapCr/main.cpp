@@ -13,8 +13,6 @@
 #include <cstring>
 
 using json = nlohmann::json;
-
-// --- КОНСТАНТЫ И СТРУКТУРЫ ---
 const int TILE_SIZE = 64;
 const int JSON_BUFFER_SIZE = 4096;
 const float CIRCLE_RADIUS = 15.0f;
@@ -33,7 +31,6 @@ struct EditorAsset {
     Texture2D texture;
 };
 
-// --- ГЛОБАЛЬНЫЕ ДАННЫЕ РЕДАКТОРА ---
 std::vector<MapEntity> entities;
 std::vector<EditorAsset> assetLibrary;
 int selectedEntityIdx = -1;
@@ -47,27 +44,21 @@ int mapHeight = 50;
 bool showJsonEditor = false;
 bool isEditingJson = false;
 
-// Цвета для кругов объектов
 Color circleColors[] = {
     ORANGE, RED, GREEN, BLUE, PURPLE, YELLOW, PINK, SKYBLUE
 };
 
-// --- МАТЕМАТИКА ПРОЕКЦИЙ ---
 Vector2 WorldToIso(Vector2 worldPos) {
-    // Конвертируем мировые координаты в изометрические
     float isoX = (worldPos.x - worldPos.y);
     float isoY = (worldPos.x + worldPos.y) * 0.5f;
     return { isoX, isoY };
 }
 
 Vector2 IsoToWorld(Vector2 isoPos) {
-    // Конвертируем изометрические координаты в мировые
     float worldX = (2.0f * isoPos.y + isoPos.x) * 0.5f;
     float worldY = (2.0f * isoPos.y - isoPos.x) * 0.5f;
     return { worldX, worldY };
 }
-
-// --- ФУНКЦИИ ЗАГРУЗКИ/СОХРАНЕНИЯ ---
 void SaveMap(const std::string& path) {
     json j;
     j["mapInfo"]["width"] = mapWidth;
@@ -231,8 +222,6 @@ int main() {
         else {
             Vector2 mousePos = GetMousePosition();
             bool mouseOverUI = IsMouseOverUI(mousePos);
-
-            // Управление камерой
             if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
                 Vector2 delta = GetMouseDelta();
                 camera.target = Vector2Subtract(camera.target, Vector2Scale(delta, 1.0f / camera.zoom));
@@ -249,22 +238,15 @@ int main() {
                 camera.target = Vector2Add(camera.target,
                     Vector2Subtract(mouseWorldBefore, mouseWorldAfter));
             }
-
-            // Логика редактирования
             if (!mouseOverUI) {
                 Vector2 mouseWorld = GetScreenToWorld2D(mousePos, camera);
-
-                // Обрабатываем координаты в зависимости от режима
                 Vector2 gridPos;
                 if (isIsometric) {
-                    // Для изометрии сначала конвертируем в мировые координаты
                     gridPos = IsoToWorld(mouseWorld);
                 }
                 else {
                     gridPos = mouseWorld;
                 }
-
-                // Преобразуем в координаты сетки
                 int gridX = (int)(gridPos.x / TILE_SIZE);
                 int gridY = (int)(gridPos.y / TILE_SIZE);
 
@@ -273,16 +255,13 @@ int main() {
                     Vector2 circlePos = { tilePos.x + TILE_SIZE / 2.0f, tilePos.y + TILE_SIZE / 2.0f };
 
                     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-                        if (currentTool == 2) { // Select Tool
+                        if (currentTool == 2) { 
                             selectedEntityIdx = -1;
                             float closestDist = CIRCLE_RADIUS * 2.0f;
-
-                            // Преобразуем позицию для поиска в нужной системе координат
                             Vector2 searchPos = isIsometric ? gridPos : mouseWorld;
 
                             for (int i = (int)entities.size() - 1; i >= 0; i--) {
                                 if (entities[i].isTile) {
-                                    // Для тайлов проверяем попадание в сетку
                                     Vector2 entityGridPos = {
                                         entities[i].worldPos.x / TILE_SIZE,
                                         entities[i].worldPos.y / TILE_SIZE
@@ -296,7 +275,6 @@ int main() {
                                     }
                                 }
                                 else {
-                                    // Для объектов проверяем расстояние
                                     float dist = Vector2Distance(searchPos, entities[i].worldPos);
                                     if (dist < CIRCLE_RADIUS && dist < closestDist) {
                                         selectedEntityIdx = i;
@@ -308,8 +286,7 @@ int main() {
                                 }
                             }
                         }
-                        else if (currentTool == 0) { // Tile Brush
-                            // Проверяем, есть ли уже тайл в этой позиции
+                        else if (currentTool == 0) {
                             bool tileExists = false;
                             int existingTileIdx = -1;
 
@@ -329,14 +306,12 @@ int main() {
                             }
 
                             if (tileExists) {
-                                // Редактируем существующий тайл
                                 entities[existingTileIdx].textureId = activeTextureIdx;
                                 selectedEntityIdx = existingTileIdx;
                                 strncpy(jsonEditBuffer, entities[existingTileIdx].jsonProperties.c_str(), JSON_BUFFER_SIZE - 1);
                                 showJsonEditor = true;
                             }
                             else {
-                                // Создаем новый тайл
                                 MapEntity newEnt = {
                                     activeTextureIdx,
                                     tilePos,
@@ -348,7 +323,7 @@ int main() {
                                 entities.push_back(newEnt);
                             }
                         }
-                        else if (currentTool == 1) { // Circle Object
+                        else if (currentTool == 1) { 
                             MapEntity newEnt = {
                                 activeTextureIdx,
                                 circlePos,
@@ -364,8 +339,6 @@ int main() {
                             showJsonEditor = true;
                         }
                     }
-
-                    // Перемещение объекта
                     if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && selectedEntityIdx != -1 &&
                         !entities[selectedEntityIdx].isTile && currentTool == 2) {
 
@@ -376,8 +349,6 @@ int main() {
                             entities[selectedEntityIdx].worldPos = isIsometric ? gridPos : mouseWorld;
                         }
                     }
-
-                    // Удаление тайла
                     if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && currentTool == 0) {
                         for (int i = (int)entities.size() - 1; i >= 0; i--) {
                             if (entities[i].isTile) {
@@ -402,38 +373,26 @@ int main() {
                     }
                 }
             }
-
-            // Удаление объекта
             if (IsKeyPressed(KEY_DELETE) && selectedEntityIdx != -1) {
                 entities.erase(entities.begin() + selectedEntityIdx);
                 selectedEntityIdx = -1;
                 showJsonEditor = false;
             }
-
-            // Отрисовка мира
             BeginMode2D(camera);
             {
-                // Отрисовка сетки и фона
                 if (isIsometric) {
-                    // Изометрическая сетка
                     for (int y = 0; y < mapHeight; y++) {
                         for (int x = 0; x < mapWidth; x++) {
                             Vector2 worldPos = { (float)x * TILE_SIZE, (float)y * TILE_SIZE };
                             Vector2 isoPos = WorldToIso(worldPos);
-
-                            // Ромб
                             Vector2 points[4] = {
                                 { isoPos.x, isoPos.y - TILE_SIZE / 2 },
                                 { isoPos.x + TILE_SIZE / 2, isoPos.y },
                                 { isoPos.x, isoPos.y + TILE_SIZE / 2 },
                                 { isoPos.x - TILE_SIZE / 2, isoPos.y }
                             };
-
-                            // Заливка
                             DrawTriangle(points[0], points[1], points[2], ColorAlpha(DARKGRAY, 0.3f));
                             DrawTriangle(points[0], points[2], points[3], ColorAlpha(DARKGRAY, 0.3f));
-
-                            // Контур
                             DrawLineV(points[0], points[1], DARKGRAY);
                             DrawLineV(points[1], points[2], DARKGRAY);
                             DrawLineV(points[2], points[3], DARKGRAY);
@@ -442,7 +401,6 @@ int main() {
                     }
                 }
                 else {
-                    // Ортогональная сетка
                     DrawRectangle(0, 0, mapWidth * TILE_SIZE, mapHeight * TILE_SIZE, ColorAlpha(GRAY, 0.1f));
 
                     for (int i = 0; i <= mapWidth; i++) {
@@ -452,20 +410,16 @@ int main() {
                         DrawLine(0, i * TILE_SIZE, mapWidth * TILE_SIZE, i * TILE_SIZE, DARKGRAY);
                     }
                 }
-
-                // Отрисовка сущностей
                 for (int i = 0; i < (int)entities.size(); i++) {
                     Vector2 drawPos = entities[i].worldPos;
 
                     if (isIsometric && entities[i].isTile) {
-                        // Для тайлов в изометрии преобразуем координаты
                         drawPos = WorldToIso(drawPos);
                     }
 
                     if (entities[i].isTile) {
                         if (entities[i].textureId >= 0 && entities[i].textureId < (int)assetLibrary.size()) {
                             if (isIsometric) {
-                                // В изометрии рисуем текстуру с центром в позиции тайла
                                 Rectangle source = { 0, 0, (float)assetLibrary[entities[i].textureId].texture.width,
                                                    (float)assetLibrary[entities[i].textureId].texture.height };
                                 Rectangle dest = { drawPos.x, drawPos.y, (float)TILE_SIZE, (float)TILE_SIZE };
@@ -480,7 +434,6 @@ int main() {
                         }
                         else {
                             if (isIsometric) {
-                                // Ромб для тайла без текстуры
                                 Vector2 points[4] = {
                                     { drawPos.x, drawPos.y - TILE_SIZE / 2 },
                                     { drawPos.x + TILE_SIZE / 2, drawPos.y },
@@ -498,7 +451,6 @@ int main() {
                         }
                     }
                     else {
-                        // Объекты (круги)
                         Color drawColor = entities[i].circleColor;
                         if (i == selectedEntityIdx) {
                             drawColor = ColorAlpha(RED, 0.7f);
@@ -509,12 +461,8 @@ int main() {
                         DrawCircleV(drawPos, 3.0f, WHITE);
                     }
                 }
-
-                // Предпросмотр
                 if (!mouseOverUI && currentTool != 2) {
                     Vector2 mouseWorld = GetScreenToWorld2D(mousePos, camera);
-
-                    // Определяем позицию в сетке
                     Vector2 gridPos;
                     if (isIsometric) {
                         gridPos = IsoToWorld(mouseWorld);
@@ -538,7 +486,7 @@ int main() {
                             previewPos = WorldToIso(circlePos);
                         }
 
-                        if (currentTool == 0) { // Предпросмотр тайла
+                        if (currentTool == 0) {
                             if (activeTextureIdx >= 0 && activeTextureIdx < (int)assetLibrary.size()) {
                                 if (isIsometric) {
                                     Rectangle source = { 0, 0, (float)assetLibrary[activeTextureIdx].texture.width,
@@ -569,7 +517,7 @@ int main() {
                                     2.0f, ColorAlpha(GREEN, 0.7f));
                             }
                         }
-                        else if (currentTool == 1) { // Предпросмотр круга
+                        else if (currentTool == 1) {
                             Vector2 drawPos = isIsometric ? WorldToIso(circlePos) : circlePos;
                             DrawCircleLinesV(drawPos, CIRCLE_RADIUS, ColorAlpha(GREEN, 0.7f));
                         }
@@ -577,18 +525,9 @@ int main() {
                 }
             }
             EndMode2D();
-
-            // --- ИНТЕРФЕЙС ---
-            // Панель инструментов слева
             GuiWindowBox({ 10, 10, 250, 450 }, "Toolbar");
-
-            // Инструменты
             GuiLabel({ 20, 40, 100, 20 }, "Tools:");
-
-            // Отдельные кнопки для каждого инструмента
             static bool toolButtons[3] = { false, false, false };
-
-            // Обработка нажатий кнопок инструментов
             if (GuiToggle({ 20, 65, 230, 25 }, "Tile Brush", &toolButtons[0])) {
                 if (toolButtons[0]) {
                     currentTool = 0;
@@ -612,17 +551,11 @@ int main() {
                     toolButtons[1] = false;
                 }
             }
-
-            // Устанавливаем правильное состояние кнопок
             toolButtons[0] = (currentTool == 0);
             toolButtons[1] = (currentTool == 1);
             toolButtons[2] = (currentTool == 2);
-
-            // Отображение текущего инструмента
             const char* toolNames[] = { "Tile Brush", "Circle Object", "Select/Edit" };
             GuiLabel({ 20, 160, 230, 20 }, TextFormat("Current: %s", toolNames[currentTool]));
-
-            // Чекбоксы
             bool tempIsometric = isIsometric;
             if (GuiCheckBox({ 20, 185, 20, 20 }, NULL, &tempIsometric)) {
                 isIsometric = tempIsometric;
@@ -634,8 +567,6 @@ int main() {
                 snapToGrid = tempSnapToGrid;
             }
             GuiLabel({ 45, 210, 200, 20 }, "Snap to Grid");
-
-            // Текстуры
             GuiLabel({ 20, 240, 100, 20 }, "Active Texture:");
             if (activeTextureIdx >= 0 && activeTextureIdx < (int)assetLibrary.size()) {
                 GuiLabel({ 120, 240, 130, 20 }, assetLibrary[activeTextureIdx].name.c_str());
@@ -649,8 +580,6 @@ int main() {
                 if (activeTextureIdx < (int)assetLibrary.size() - 1) activeTextureIdx++;
                 else activeTextureIdx = 0;
             }
-
-            // Основные кнопки
             if (GuiButton({ 20, 300, 230, 25 }, "Load Texture")) {
                 nfdchar_t* outPath = nullptr;
                 nfdresult_t result = NFD_OpenDialog(&outPath, NULL, 0, NULL);
@@ -674,16 +603,12 @@ int main() {
                 selectedEntityIdx = -1;
                 showJsonEditor = false;
             }
-
-            // Статистика
             GuiLabel({ 20, 390, 230, 20 }, TextFormat("Entities: %d", (int)entities.size()));
             if (selectedEntityIdx != -1) {
                 GuiLabel({ 20, 410, 230, 20 }, TextFormat("Selected: %d", selectedEntityIdx));
                 GuiLabel({ 20, 430, 230, 20 }, TextFormat("Type: %s",
                     entities[selectedEntityIdx].isTile ? "Tile" : "Circle"));
             }
-
-            // Библиотека текстур
             GuiWindowBox({ (float)GetScreenWidth() - 260, 10, 250, 300 }, "Asset Library");
             for (int i = 0; i < (int)assetLibrary.size(); i++) {
                 Rectangle btnRect = { (float)GetScreenWidth() - 250, 40.0f + i * 55, 230, 50 };
@@ -695,8 +620,6 @@ int main() {
                     DrawRectangleLinesEx(btnRect, 2, GREEN);
                 }
             }
-
-            // Редактор JSON
             if (showJsonEditor && selectedEntityIdx != -1) {
                 GuiWindowBox({ (float)GetScreenWidth() - 260, 320, 250, 300 },
                     entities[selectedEntityIdx].isTile ? "Tile Inspector" : "Circle Inspector");
@@ -745,8 +668,6 @@ int main() {
                     if (GuiButton({ (float)GetScreenWidth() - 250, 510, 230, 25 }, "Edit JSON")) {
                         isEditingJson = true;
                     }
-
-                    // Кнопки управления
                     if (GuiButton({ (float)GetScreenWidth() - 250, 540, 110, 30 }, "Delete")) {
                         entities.erase(entities.begin() + selectedEntityIdx);
                         selectedEntityIdx = -1;
@@ -774,8 +695,6 @@ int main() {
                     if (GuiButton({ (float)GetScreenWidth() - 250, 450, 230, 25 }, "Edit JSON")) {
                         isEditingJson = true;
                     }
-
-                    // Кнопки управления
                     if (GuiButton({ (float)GetScreenWidth() - 250, 480, 110, 30 }, "Delete")) {
                         entities.erase(entities.begin() + selectedEntityIdx);
                         selectedEntityIdx = -1;
@@ -788,8 +707,6 @@ int main() {
                         isEditingJson = false;
                     }
                 }
-
-                // Модальное окно редактирования JSON
                 if (isEditingJson) {
                     int result = GuiTextInputBox(
                         { (float)GetScreenWidth() / 2 - 200, (float)GetScreenHeight() / 2 - 150, 400, 300 },
@@ -801,7 +718,7 @@ int main() {
                         nullptr
                     );
 
-                    if (result == 1) { // Save
+                    if (result == 1) { 
                         try {
                             json test = json::parse(jsonEditBuffer);
                             entities[selectedEntityIdx].jsonProperties = jsonEditBuffer;
@@ -812,13 +729,11 @@ int main() {
                         }
                         isEditingJson = false;
                     }
-                    else if (result == 0) { // Cancel
+                    else if (result == 0) { 
                         isEditingJson = false;
                     }
                 }
             }
-
-            // Подсказки
             DrawText("LMB: Place/Select | RMB: Move Camera/Delete Tiles | DEL: Delete Selected",
                 10, GetScreenHeight() - 30, 10, LIGHTGRAY);
         }

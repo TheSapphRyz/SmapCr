@@ -175,6 +175,7 @@
     <ClInclude Include="..\..\..\..\Downloads\zvec.h" />
     <ClInclude Include="..\..\Zipcord\ZIPCORD\ZIPCORD\stb_image.h" />
     <ClInclude Include="..\..\Zipcord\ZIPCORD\ZIPCORD\stb_image_write.h" />
+    <ClInclude Include="vec.hpp" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="sho.txt" />
