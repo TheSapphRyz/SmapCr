@@ -1,0 +1,2029 @@
+#define SDL_MAIN_HANDLED
+#include "imgui.h"
+#include "imgui_impl_sdl2.h"
+#include "imgui_impl_vulkan.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_vulkan.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <commdlg.h>
+#endif
+#include <string>
+#include <vector>
+#include <map>
+#include <cmath>
+#include <algorithm>
+#include <fstream>
+#include <filesystem>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <queue>
+#include <functional>
+#include <future>
+
+#ifdef IMGUI_IMPL_VULKAN_USE_VOLK
+#define VOLK_IMPLEMENTATION
+#include <volk.h>
+#endif
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
+
+namespace fs = std::filesystem;
+
+// ==================== СТРУКТУРЫ ====================
+
+struct VulkanTexture {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    int width = 0, height = 0;
+};
+
+struct LeftTextureBrowser {
+    VulkanTexture struct_texture;
+    std::string name;
+};
+
+struct MapMarker {
+    int id;
+    std::string name;
+    float screen_x, screen_y;
+    float world_x, world_y;
+    json properties;
+
+    MapMarker() : id(0), name("Marker"), screen_x(0), screen_y(0), world_x(0), world_y(0) {
+        properties = json::object();
+        properties["type"] = "default";
+        properties["color"] = "#FF0000";
+    }
+};
+
+struct Tile {
+    int id = -1;
+    VulkanTexture* texture = nullptr;
+    std::string texture_path;
+    json properties;
+
+    Tile() {
+        properties = json::object();
+    }
+};
+
+struct TileSet {
+    std::string name;
+    std::vector<LeftTextureBrowser> tiles;
+    int tile_width = 32, tile_height = 32;
+    int columns = 0, rows = 0;
+
+    bool GetTileUV(int tile_index, ImVec2& uv0, ImVec2& uv1) {
+        if (tile_index < 0 || tile_index >= columns * rows || tiles.empty())
+            return false;
+
+        int col = tile_index % columns;
+        int row = tile_index / columns;
+
+        uv0.x = static_cast<float>(col * tile_width) / tiles[0].struct_texture.width;
+        uv0.y = static_cast<float>(row * tile_height) / tiles[0].struct_texture.height;
+        uv1.x = static_cast<float>((col + 1) * tile_width) / tiles[0].struct_texture.width;
+        uv1.y = static_cast<float>((row + 1) * tile_height) / tiles[0].struct_texture.height;
+
+        return true;
+    }
+};
+
+struct TileMap {
+    std::vector<std::vector<Tile>> tiles;
+    int width = 20, height = 15;
+    int tile_width = 32, tile_height = 32;
+
+    bool FillFromImage(VulkanTexture& texture, TileSet& tile_set) {
+        if (texture.width == 0 || texture.height == 0) return false;
+
+        width = texture.width / tile_width;
+        height = texture.height / tile_height;
+
+        tiles.resize(height);
+        for (int y = 0; y < height; y++) {
+            tiles[y].resize(width);
+            for (int x = 0; x < width; x++) {
+                tiles[y][x].id = y * width + x;
+                tiles[y][x].texture = &texture;
+                tiles[y][x].texture_path = "tileset_" + std::to_string(y * width + x);
+            }
+        }
+
+        LeftTextureBrowser tile_browser;
+        tile_browser.struct_texture = texture;
+        tile_browser.name = "Tileset";
+        tile_set.tiles.push_back(tile_browser);
+        tile_set.columns = width;
+        tile_set.rows = height;
+
+        return true;
+    }
+};
+
+struct MapProject {
+    std::string name = "New Map";
+    std::vector<LeftTextureBrowser> loaded_sprites;
+    bool is_modified = false;
+};
+
+struct MapView {
+    float offset_x = 0.0f, offset_y = 0.0f;
+    float scale = 1.0f;
+    std::map<int, MapMarker> markers;
+    int next_marker_id = 1;
+    int selected_marker_id = -1;
+    bool show_marker_editor = false;
+    bool show_grid = true;
+    bool is_dragging = false;
+    ImVec2 drag_start;
+    ImVec2 drag_start_offset;
+
+    ImVec2 ScreenToWorld(const ImVec2& screen_pos, const ImVec2& map_pos) {
+        return ImVec2(
+            (screen_pos.x - map_pos.x - offset_x) / scale,
+            (screen_pos.y - map_pos.y - offset_y) / scale
+        );
+    }
+
+    ImVec2 WorldToScreen(const ImVec2& world_pos, const ImVec2& map_pos) {
+        return ImVec2(
+            map_pos.x + offset_x + world_pos.x * scale,
+            map_pos.y + offset_y + world_pos.y * scale
+        );
+    }
+
+    int GetMarkerAtPosition(const ImVec2& screen_pos, const ImVec2& map_pos, float threshold = 15.0f) {
+        for (const auto& pair : markers) {
+            int id = pair.first;
+            const MapMarker& marker = pair.second;
+
+            ImVec2 marker_screen = WorldToScreen(ImVec2(marker.world_x, marker.world_y), map_pos);
+            float dx = screen_pos.x - marker_screen.x;
+            float dy = screen_pos.y - marker_screen.y;
+            float distance = sqrtf(dx * dx + dy * dy);
+
+            if (distance < threshold * scale) {
+                return id;
+            }
+        }
+        return -1;
+    }
+
+    void RemoveMarker(int id) {
+        markers.erase(id);
+        if (selected_marker_id == id) {
+            selected_marker_id = -1;
+            show_marker_editor = false;
+        }
+    }
+
+    void AddMarker(const ImVec2& screen_pos, const ImVec2& map_pos, const ImVec2& world_pos) {
+        MapMarker marker;
+        marker.id = next_marker_id++;
+        marker.name = "Marker " + std::to_string(marker.id);
+        marker.screen_x = screen_pos.x;
+        marker.screen_y = screen_pos.y;
+        marker.world_x = world_pos.x;
+        marker.world_y = world_pos.y;
+
+        markers[marker.id] = marker;
+        selected_marker_id = marker.id;
+        show_marker_editor = true;
+    }
+
+    json ToJson() const {
+        json j = json::array();
+        for (const auto& pair : markers) {
+            const MapMarker& marker = pair.second;
+            json marker_json;
+            marker_json["id"] = marker.id;
+            marker_json["name"] = marker.name;
+            marker_json["screen_x"] = marker.screen_x;
+            marker_json["screen_y"] = marker.screen_y;
+            marker_json["world_x"] = marker.world_x;
+            marker_json["world_y"] = marker.world_y;
+            marker_json["properties"] = marker.properties;
+            j.push_back(marker_json);
+        }
+        return j;
+    }
+
+    void FromJson(const json& j) {
+        markers.clear();
+        next_marker_id = 1;
+
+        if (j.is_array()) {
+            for (const auto& marker_json : j) {
+                MapMarker marker;
+                marker.id = marker_json.value("id", 0);
+                marker.name = marker_json.value("name", "Marker");
+                marker.screen_x = marker_json.value("screen_x", 0.0f);
+                marker.screen_y = marker_json.value("screen_y", 0.0f);
+                marker.world_x = marker_json.value("world_x", 0.0f);
+                marker.world_y = marker_json.value("world_y", 0.0f);
+                marker.properties = marker_json.value("properties", json::object());
+
+                markers[marker.id] = marker;
+                if (marker.id >= next_marker_id) {
+                    next_marker_id = marker.id + 1;
+                }
+            }
+        }
+    }
+};
+
+// ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
+
+std::vector<std::string> con_msgs;
+std::vector<LeftTextureBrowser> imgs;
+
+static MapProject g_CurrentProject;
+static MapView g_MapView;
+static TileMap g_TileMap;
+static TileSet g_TileSet;
+
+static bool g_ShowNewMapDialog = false;
+static bool g_ShowLoadTileImageDialog = false;
+static bool g_ShowTileEditor = false;
+static bool g_ShowLoadSpritesDialog = false;
+static int g_SelectedTileX = -1, g_SelectedTileY = -1;
+
+static VkAllocationCallbacks* g_Allocator = nullptr;
+static VkInstance g_Instance = VK_NULL_HANDLE;
+static VkPhysicalDevice g_PhysicalDevice = VK_NULL_HANDLE;
+static VkDevice g_Device = VK_NULL_HANDLE;
+static uint32_t g_QueueFamily = (uint32_t)-1;
+static VkQueue g_Queue = VK_NULL_HANDLE;
+static VkPipelineCache g_PipelineCache = VK_NULL_HANDLE;
+static VkDescriptorPool g_DescriptorPool = VK_NULL_HANDLE;
+static VkCommandPool g_CommandPool = VK_NULL_HANDLE;
+
+static ImGui_ImplVulkanH_Window g_MainWindowData;
+static uint32_t g_MinImageCount = 2;
+static bool g_SwapChainRebuild = false;
+
+// ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ VULKAN ====================
+
+static void check_vk_result(VkResult err) {
+    if (err == VK_SUCCESS) return;
+    fprintf(stderr, "[vulkan] Error: VkResult = %d\n", err);
+    if (err < 0) abort();
+}
+
+uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(g_PhysicalDevice, &memProperties);
+
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((typeFilter & (1 << i)) &&
+            (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    con_msgs.push_back("Failed to find suitable memory type!");
+    return 0;
+}
+
+VkBuffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
+    VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateBuffer(g_Device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+        con_msgs.push_back("Failed to create buffer!");
+        return VK_NULL_HANDLE;
+    }
+
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(g_Device, buffer, &memRequirements);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+
+    if (vkAllocateMemory(g_Device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
+        con_msgs.push_back("Failed to allocate buffer memory!");
+        return VK_NULL_HANDLE;
+    }
+
+    vkBindBufferMemory(g_Device, buffer, bufferMemory, 0);
+    return buffer;
+}
+
+void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height) {
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = g_CommandPool;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer commandBuffer;
+    vkAllocateCommandBuffers(g_Device, &allocInfo, &commandBuffer);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = { 0, 0, 0 };
+    region.imageExtent = { width, height, 1 };
+
+    vkCmdCopyBufferToImage(commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    vkEndCommandBuffer(commandBuffer);
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+
+    vkQueueSubmit(g_Queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g_Queue);
+    vkFreeCommandBuffers(g_Device, g_CommandPool, 1, &commandBuffer);
+}
+
+void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = g_CommandPool;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer commandBuffer;
+    vkAllocateCommandBuffers(g_Device, &allocInfo, &commandBuffer);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+
+    VkPipelineStageFlags sourceStage, destinationStage;
+
+    if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
+    else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    }
+    else {
+        con_msgs.push_back("Unsupported layout transition!");
+        return;
+    }
+
+    vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    vkEndCommandBuffer(commandBuffer);
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+
+    vkQueueSubmit(g_Queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g_Queue);
+    vkFreeCommandBuffers(g_Device, g_CommandPool, 1, &commandBuffer);
+}
+
+VulkanTexture CreateTextureFromRGBA(const std::vector<uint8_t>& rgba_data, int width, int height) {
+    VulkanTexture texture;
+    texture.width = width;
+    texture.height = height;
+
+    VkDeviceSize imageSize = width * height * 4;
+
+    VkBuffer stagingBuffer;
+    VkDeviceMemory stagingBufferMemory;
+    createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        stagingBuffer, stagingBufferMemory);
+
+    void* data;
+    vkMapMemory(g_Device, stagingBufferMemory, 0, imageSize, 0, &data);
+    memcpy(data, rgba_data.data(), static_cast<size_t>(imageSize));
+    vkUnmapMemory(g_Device, stagingBufferMemory);
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = static_cast<uint32_t>(width);
+    imageInfo.extent.height = static_cast<uint32_t>(height);
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+
+    if (vkCreateImage(g_Device, &imageInfo, nullptr, &texture.image) != VK_SUCCESS) {
+        con_msgs.push_back("Failed to create image!");
+    }
+
+    VkMemoryRequirements memRequirements;
+    vkGetImageMemoryRequirements(g_Device, texture.image, &memRequirements);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    if (vkAllocateMemory(g_Device, &allocInfo, nullptr, &texture.memory) != VK_SUCCESS) {
+        con_msgs.push_back("Failed to allocate image memory!");
+    }
+
+    vkBindImageMemory(g_Device, texture.image, texture.memory, 0);
+
+    transitionImageLayout(texture.image, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    copyBufferToImage(stagingBuffer, texture.image, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    transitionImageLayout(texture.image, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    vkDestroyBuffer(g_Device, stagingBuffer, nullptr);
+    vkFreeMemory(g_Device, stagingBufferMemory, nullptr);
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = texture.image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+
+    if (vkCreateImageView(g_Device, &viewInfo, nullptr, &texture.view) != VK_SUCCESS) {
+        con_msgs.push_back("Failed to create image view!");
+    }
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+
+    if (vkCreateSampler(g_Device, &samplerInfo, nullptr, &texture.sampler) != VK_SUCCESS) {
+        con_msgs.push_back("Failed to create sampler!");
+    }
+
+    texture.descriptor_set = ImGui_ImplVulkan_AddTexture(
+        texture.sampler,
+        texture.view,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    );
+
+    return texture;
+}
+
+VulkanTexture LoadTextureFromFile(const char* filename) {
+    int width, height, channels;
+    stbi_uc* pixels = stbi_load(filename, &width, &height, &channels, STBI_rgb_alpha);
+
+    if (!pixels) {
+        throw std::runtime_error("Failed to load texture file");
+    }
+
+    std::vector<uint8_t> image_data(pixels, pixels + width * height * 4);
+    stbi_image_free(pixels);
+
+    return CreateTextureFromRGBA(image_data, width, height);
+}
+
+void DestroyTexture(VulkanTexture& texture) {
+    if (texture.sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(g_Device, texture.sampler, nullptr);
+        texture.sampler = VK_NULL_HANDLE;
+    }
+
+    if (texture.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(g_Device, texture.view, nullptr);
+        texture.view = VK_NULL_HANDLE;
+    }
+
+    if (texture.image != VK_NULL_HANDLE) {
+        vkDestroyImage(g_Device, texture.image, nullptr);
+        texture.image = VK_NULL_HANDLE;
+    }
+
+    if (texture.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(g_Device, texture.memory, nullptr);
+        texture.memory = VK_NULL_HANDLE;
+    }
+
+    texture.descriptor_set = VK_NULL_HANDLE;
+}
+
+// ==================== ФУНКЦИИ ДЛЯ ВЫБОРА ФАЙЛОВ WINDOWS ====================
+
+#ifdef _WIN32
+std::string OpenFileDialog(const char* filter = "Image Files\0*.png;*.jpg;*.jpeg;*.bmp;*.tga\0All Files\0*.*\0") {
+    OPENFILENAMEA ofn;
+    char filename[1024] = { 0 };
+
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = sizeof(filename);
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+    if (GetOpenFileNameA(&ofn)) {
+        return filename;
+    }
+    return "";
+}
+
+std::vector<std::string> OpenMultipleFilesDialog(const char* filter = "Image Files\0*.png;*.jpg;*.jpeg;*.bmp;*.tga\0All Files\0*.*\0") {
+    OPENFILENAMEA ofn;
+    char filenames[8192] = { 0 };
+
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = filenames;
+    ofn.nMaxFile = sizeof(filenames);
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_ALLOWMULTISELECT;
+
+    std::vector<std::string> result;
+    if (GetOpenFileNameA(&ofn)) {
+        char* ptr = filenames;
+        std::string directory = ptr;
+        ptr += directory.length() + 1;
+
+        if (*ptr) {
+            while (*ptr) {
+                std::string filename = ptr;
+                result.push_back(directory + "\\" + filename);
+                ptr += filename.length() + 1;
+            }
+        }
+        else {
+            result.push_back(directory);
+        }
+    }
+    return result;
+}
+#endif
+
+// ==================== ДИАЛОГОВЫЕ ОКНА ====================
+
+void ShowNewMapDialog() {
+    if (g_ShowNewMapDialog) {
+        ImGui::OpenPopup("Create New Map");
+        g_ShowNewMapDialog = false;
+    }
+
+    if (ImGui::BeginPopupModal("Create New Map", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        static char map_name[256] = "New Map";
+        static int map_width = 20;
+        static int map_height = 15;
+        static int tile_size = 32;
+        static bool from_image = false;
+
+        ImGui::InputText("Map Name", map_name, sizeof(map_name));
+        ImGui::DragInt("Width (tiles)", &map_width, 1, 1, 1000);
+        ImGui::DragInt("Height (tiles)", &map_height, 1, 1, 1000);
+        ImGui::DragInt("Tile Size (px)", &tile_size, 1, 16, 128);
+        ImGui::Checkbox("Create from image", &from_image);
+
+        if (from_image) {
+            if (ImGui::Button("Select Image...")) {
+                g_ShowLoadTileImageDialog = true;
+            }
+        }
+
+        ImGui::Separator();
+
+        if (ImGui::Button("Create", ImVec2(120, 0))) {
+            g_CurrentProject.name = map_name;
+            g_TileMap.width = map_width;
+            g_TileMap.height = map_height;
+            g_TileMap.tile_width = tile_size;
+            g_TileMap.tile_height = tile_size;
+            g_TileSet.tile_width = tile_size;
+            g_TileSet.tile_height = tile_size;
+
+            g_TileMap.tiles.resize(map_height);
+            for (int y = 0; y < map_height; y++) {
+                g_TileMap.tiles[y].resize(map_width);
+                for (int x = 0; x < map_width; x++) {
+                    g_TileMap.tiles[y][x] = Tile();
+                }
+            }
+
+            g_MapView.markers.clear();
+            g_MapView.next_marker_id = 1;
+            g_CurrentProject.is_modified = true;
+
+            con_msgs.push_back("Map created: " + std::string(map_name));
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void ShowLoadTileImageDialog() {
+    if (g_ShowLoadTileImageDialog) {
+        ImGui::OpenPopup("Load Image for Map");
+        g_ShowLoadTileImageDialog = false;
+    }
+
+    if (ImGui::BeginPopupModal("Load Image for Map", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        static char image_path[1024] = "";
+        static int tile_size = 32;
+
+        ImGui::InputText("Image Path", image_path, sizeof(image_path));
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) {
+#ifdef _WIN32
+            auto file = OpenFileDialog();
+            if (!file.empty()) {
+                strcpy(image_path, file.c_str());
+            }
+#endif
+        }
+
+        ImGui::DragInt("Tile Size (px)", &tile_size, 1, 16, 128);
+
+        if (strlen(image_path) > 0 && fs::exists(image_path)) {
+            int img_width, img_height, channels;
+            stbi_info(image_path, &img_width, &img_height, &channels);
+            ImGui::Text("Image: %d x %d", img_width, img_height);
+
+            if (img_width > 0 && img_height > 0) {
+                int tiles_x = img_width / tile_size;
+                int tiles_y = img_height / tile_size;
+                ImGui::Text("Will create: %d x %d tiles", tiles_x, tiles_y);
+            }
+        }
+
+        ImGui::Separator();
+
+        if (ImGui::Button("Load", ImVec2(120, 0))) {
+            try {
+                VulkanTexture texture = LoadTextureFromFile(image_path);
+                g_TileMap.tile_width = tile_size;
+                g_TileMap.tile_height = tile_size;
+
+                if (g_TileMap.FillFromImage(texture, g_TileSet)) {
+                    g_CurrentProject.name = fs::path(image_path).stem().string();
+                    g_CurrentProject.is_modified = true;
+                    con_msgs.push_back("Tilemap created from image");
+                }
+
+                ImGui::CloseCurrentPopup();
+            }
+            catch (const std::exception& e) {
+                con_msgs.push_back("Error: " + std::string(e.what()));
+            }
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void ShowLoadSpritesDialog() {
+    if (g_ShowLoadSpritesDialog) {
+        ImGui::OpenPopup("Load Sprites");
+        g_ShowLoadSpritesDialog = false;
+    }
+
+    if (ImGui::BeginPopupModal("Load Sprites", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        static std::vector<std::string> selected_files;
+        static bool show_file_list = false;
+
+        if (ImGui::Button("Select Files...")) {
+#ifdef _WIN32
+            selected_files = OpenMultipleFilesDialog();
+            show_file_list = !selected_files.empty();
+#endif
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Clear Selection")) {
+            selected_files.clear();
+            show_file_list = false;
+        }
+
+        if (show_file_list && !selected_files.empty()) {
+            ImGui::Separator();
+            ImGui::Text("Selected Files:");
+            ImGui::BeginChild("FileList", ImVec2(400, 200), true);
+            for (const auto& file : selected_files) {
+                ImGui::Text("%s", fs::path(file).filename().string().c_str());
+            }
+            ImGui::EndChild();
+            ImGui::Text("Total: %d files", (int)selected_files.size());
+        }
+
+        ImGui::Separator();
+
+        if (ImGui::Button("Load", ImVec2(120, 0)) && !selected_files.empty()) {
+            int loaded_count = 0;
+            for (const auto& file : selected_files) {
+                try {
+                    VulkanTexture texture = LoadTextureFromFile(file.c_str());
+                    LeftTextureBrowser sprite;
+                    sprite.struct_texture = texture;
+                    sprite.name = file;
+                    g_CurrentProject.loaded_sprites.push_back(sprite);
+                    imgs.push_back(sprite);
+                    loaded_count++;
+                    con_msgs.push_back("Loaded: " + fs::path(file).filename().string());
+                }
+                catch (const std::exception& e) {
+                    con_msgs.push_back("Failed: " + fs::path(file).filename().string());
+                }
+            }
+
+            if (loaded_count > 0) {
+                g_CurrentProject.is_modified = true;
+                con_msgs.push_back("Successfully loaded " + std::to_string(loaded_count) + " sprites");
+            }
+
+            selected_files.clear();
+            show_file_list = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+            selected_files.clear();
+            show_file_list = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void ShowTileEditor() {
+    if (!g_ShowTileEditor) return;
+
+    ImGui::SetNextWindowSize(ImVec2(500, 600), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Tile Editor", &g_ShowTileEditor)) {
+        if (g_SelectedTileX >= 0 && g_SelectedTileY >= 0 &&
+            g_SelectedTileY < g_TileMap.tiles.size() &&
+            g_SelectedTileX < g_TileMap.tiles[g_SelectedTileY].size()) {
+
+            Tile& tile = g_TileMap.tiles[g_SelectedTileY][g_SelectedTileX];
+
+            ImGui::Text("Tile Position: (%d, %d)", g_SelectedTileX, g_SelectedTileY);
+            ImGui::Text("Tile ID: %d", tile.id);
+            ImGui::Separator();
+
+            if (tile.texture != nullptr && tile.texture->descriptor_set != VK_NULL_HANDLE) {
+                ImGui::Text("Texture:");
+                ImGui::Image(tile.texture->descriptor_set, ImVec2(128, 128));
+            }
+
+            ImGui::Separator();
+
+            if (!g_TileSet.tiles.empty()) {
+                ImGui::Text("Select from Tileset:");
+                float preview_size = 64.0f;
+                int tiles_per_row = 6;
+
+                ImGui::BeginChild("##tileset_view", ImVec2(-1, 200), true);
+
+                for (size_t i = 0; i < g_TileSet.tiles.size(); i++) {
+                    auto& tile_browser = g_TileSet.tiles[i];
+
+                    if (tile_browser.struct_texture.descriptor_set != VK_NULL_HANDLE) {
+                        ImGui::PushID(static_cast<int>(i));
+
+                        if (g_TileSet.columns > 0 && g_TileSet.rows > 0) {
+                            for (int tile_index = 0; tile_index < g_TileSet.columns * g_TileSet.rows; tile_index++) {
+                                ImVec2 uv0, uv1;
+                                if (g_TileSet.GetTileUV(tile_index, uv0, uv1)) {
+                                    if (ImGui::ImageButton(tile_browser.struct_texture.descriptor_set,
+                                        ImVec2(preview_size, preview_size),
+                                        uv0, uv1)) {
+                                        tile.id = tile_index;
+                                        tile.texture = &tile_browser.struct_texture;
+                                        g_CurrentProject.is_modified = true;
+                                    }
+
+                                    if ((tile_index + 1) % tiles_per_row != 0) {
+                                        ImGui::SameLine();
+                                    }
+                                }
+                            }
+                        }
+
+                        ImGui::PopID();
+                    }
+                }
+
+                ImGui::EndChild();
+            }
+        }
+        else {
+            ImGui::Text("No tile selected");
+        }
+    }
+    ImGui::End();
+}
+
+void ShowMarkerEditor() {
+    if (g_MapView.show_marker_editor && g_MapView.selected_marker_id != -1) {
+        auto it = g_MapView.markers.find(g_MapView.selected_marker_id);
+        if (it != g_MapView.markers.end()) {
+            MapMarker& marker = it->second;
+
+            ImGui::SetNextWindowSize(ImVec2(400, 500), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Marker Editor", &g_MapView.show_marker_editor)) {
+                ImGui::Text("Marker ID: %d", marker.id);
+                ImGui::Separator();
+
+                char name_buf[256];
+                strncpy(name_buf, marker.name.c_str(), sizeof(name_buf));
+                if (ImGui::InputText("Name", name_buf, sizeof(name_buf))) {
+                    marker.name = name_buf;
+                    g_CurrentProject.is_modified = true;
+                }
+
+                ImGui::Text("World Coordinates:");
+                if (ImGui::DragFloat("X", &marker.world_x, 0.1f, 0.0f, (float)g_TileMap.width)) {
+                    g_CurrentProject.is_modified = true;
+                }
+                if (ImGui::DragFloat("Y", &marker.world_y, 0.1f, 0.0f, (float)g_TileMap.height)) {
+                    g_CurrentProject.is_modified = true;
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Properties (JSON):");
+
+                static char json_buf[2048] = "";
+                static bool json_initialized = false;
+
+                if (!json_initialized) {
+                    std::string json_str = marker.properties.dump(2);
+                    strncpy(json_buf, json_str.c_str(), sizeof(json_buf));
+                    json_initialized = true;
+                }
+
+                if (ImGui::InputTextMultiline("##json_editor", json_buf, sizeof(json_buf),
+                    ImVec2(-1, 200))) {
+                    try {
+                        marker.properties = json::parse(json_buf);
+                        g_CurrentProject.is_modified = true;
+                    }
+                    catch (const json::parse_error&) {
+                        // Ошибка парсинга
+                    }
+                }
+
+                ImGui::Separator();
+
+                if (ImGui::Button("Delete Marker", ImVec2(120, 30))) {
+                    g_MapView.RemoveMarker(marker.id);
+                    g_CurrentProject.is_modified = true;
+                }
+
+                ImGui::SameLine();
+
+                if (ImGui::Button("Copy JSON", ImVec2(120, 30))) {
+                    ImGui::SetClipboardText(marker.properties.dump(2).c_str());
+                    con_msgs.push_back("JSON copied to clipboard");
+                }
+
+                ImGui::SameLine();
+
+                if (ImGui::Button("Save All", ImVec2(120, 30))) {
+                    json all_markers = g_MapView.ToJson();
+                    ImGui::SetClipboardText(all_markers.dump(2).c_str());
+                    con_msgs.push_back("All markers saved to clipboard");
+                }
+            }
+            ImGui::End();
+        }
+    }
+}
+
+// ==================== ОСНОВНЫЕ ФУНКЦИИ ИНТЕРФЕЙСА ====================
+
+void DrawMapWindow(const ImVec2& size) {
+    ImGui::BeginChild("map", size, ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoDecoration);
+
+    // Панель инструментов
+    if (ImGui::BeginTable("##map_tools", 7, ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableNextRow();
+
+        ImGui::TableSetColumnIndex(0);
+        if (ImGui::Button("+")) {
+            g_MapView.scale *= 1.2f;
+            g_MapView.scale = std::max(0.1f, std::min(g_MapView.scale, 10.0f));
+        }
+
+        ImGui::TableSetColumnIndex(1);
+        if (ImGui::Button("-")) {
+            g_MapView.scale /= 1.2f;
+            g_MapView.scale = std::max(0.1f, std::min(g_MapView.scale, 10.0f));
+        }
+
+        ImGui::TableSetColumnIndex(2);
+        if (ImGui::Button("Grid")) {
+            g_MapView.show_grid = !g_MapView.show_grid;
+        }
+
+        ImGui::TableSetColumnIndex(3);
+        if (ImGui::Button("Tiles")) {
+            g_ShowTileEditor = !g_ShowTileEditor;
+        }
+
+        ImGui::TableSetColumnIndex(4);
+        if (ImGui::Button("Markers")) {
+            g_MapView.show_marker_editor = !g_MapView.show_marker_editor;
+        }
+
+        ImGui::TableSetColumnIndex(5);
+        ImGui::Text("Map: %dx%d", g_TileMap.width, g_TileMap.height);
+
+        ImGui::TableSetColumnIndex(6);
+        ImGui::Text("Tile: %dx%d", g_TileMap.tile_width, g_TileMap.tile_height);
+
+        ImGui::EndTable();
+    }
+
+    ImGui::Separator();
+
+    // Область карты
+    ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+    ImVec2 canvas_size = ImGui::GetContentRegionAvail();
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+    // Рисуем фон
+    draw_list->AddRectFilled(canvas_pos,
+        ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
+        IM_COL32(20, 20, 20, 255));
+
+    // Рассчитываем область отображения тайлов
+    float tile_display_size = g_TileMap.tile_width * g_MapView.scale;
+    float map_display_width = g_TileMap.width * tile_display_size;
+    float map_display_height = g_TileMap.height * tile_display_size;
+
+    // Центрируем карту
+    float map_offset_x = (canvas_size.x - map_display_width) * 0.5f + g_MapView.offset_x;
+    float map_offset_y = (canvas_size.y - map_display_height) * 0.5f + g_MapView.offset_y;
+
+    // Рисуем тайлы
+    for (int y = 0; y < g_TileMap.height; y++) {
+        for (int x = 0; x < g_TileMap.width; x++) {
+            float tile_x = canvas_pos.x + map_offset_x + x * tile_display_size;
+            float tile_y = canvas_pos.y + map_offset_y + y * tile_display_size;
+
+            ImVec2 tile_pos(tile_x, tile_y);
+            ImVec2 tile_size_vec(tile_display_size, tile_display_size);
+
+            // Рисуем тайл
+            Tile& tile = g_TileMap.tiles[y][x];
+
+            if (tile.texture != nullptr && tile.texture->descriptor_set != VK_NULL_HANDLE) {
+                if (tile.id >= 0 && !g_TileSet.tiles.empty() &&
+                    g_TileSet.columns > 0 && g_TileSet.rows > 0) {
+
+                    ImVec2 uv0, uv1;
+                    if (g_TileSet.GetTileUV(tile.id, uv0, uv1)) {
+                        draw_list->AddImage(tile.texture->descriptor_set,
+                            tile_pos,
+                            ImVec2(tile_pos.x + tile_display_size,
+                                tile_pos.y + tile_display_size),
+                            uv0, uv1);
+                    }
+                }
+                else {
+                    draw_list->AddImage(tile.texture->descriptor_set,
+                        tile_pos,
+                        ImVec2(tile_pos.x + tile_display_size,
+                            tile_pos.y + tile_display_size));
+                }
+            }
+            else {
+                draw_list->AddRectFilled(tile_pos,
+                    ImVec2(tile_pos.x + tile_display_size,
+                        tile_pos.y + tile_display_size),
+                    IM_COL32(40, 40, 40, 255));
+            }
+
+            // Сетка
+            if (g_MapView.show_grid) {
+                draw_list->AddRect(tile_pos,
+                    ImVec2(tile_pos.x + tile_display_size,
+                        tile_pos.y + tile_display_size),
+                    IM_COL32(100, 100, 100, 50));
+            }
+
+            // Выделение выбранного тайла
+            if (x == g_SelectedTileX && y == g_SelectedTileY) {
+                draw_list->AddRect(tile_pos,
+                    ImVec2(tile_pos.x + tile_display_size,
+                        tile_pos.y + tile_display_size),
+                    IM_COL32(255, 255, 0, 255), 0, 0, 3.0f);
+            }
+        }
+    }
+
+    // Рисуем маркеры
+    for (const auto& pair : g_MapView.markers) {
+        int id = pair.first;
+        const MapMarker& marker = pair.second;
+
+        ImVec2 world_pos(marker.world_x * g_TileMap.tile_width,
+            marker.world_y * g_TileMap.tile_height);
+        ImVec2 screen_pos = g_MapView.WorldToScreen(world_pos, canvas_pos);
+        screen_pos.x += map_offset_x;
+        screen_pos.y += map_offset_y;
+
+        // Определяем цвет маркера
+        ImU32 color = IM_COL32(255, 0, 0, 255); // Красный по умолчанию
+        if (marker.properties.contains("color") && marker.properties["color"].is_string()) {
+            std::string color_str = marker.properties["color"];
+            if (color_str.length() == 7 && color_str[0] == '#') {
+                unsigned int hex_color = strtoul(color_str.substr(1).c_str(), nullptr, 16);
+                color = IM_COL32(
+                    (hex_color >> 16) & 0xFF,
+                    (hex_color >> 8) & 0xFF,
+                    hex_color & 0xFF,
+                    255
+                );
+            }
+        }
+
+        // Рисуем маркер
+        draw_list->AddCircleFilled(screen_pos, 10.0f * g_MapView.scale, color, 12);
+        draw_list->AddCircle(screen_pos, 10.0f * g_MapView.scale,
+            IM_COL32(255, 255, 255, 255), 12, 2.0f);
+
+        // Подпись маркера
+        if (tile_display_size > 20.0f) {
+            draw_list->AddText(ImVec2(screen_pos.x + 15, screen_pos.y - 10),
+                IM_COL32(255, 255, 255, 255), marker.name.c_str());
+        }
+
+        // Выделение выбранного маркера
+        if (id == g_MapView.selected_marker_id) {
+            draw_list->AddCircle(screen_pos, 15.0f * g_MapView.scale,
+                IM_COL32(255, 255, 0, 255), 12, 3.0f);
+        }
+    }
+
+    // Обработка ввода
+    ImGui::InvisibleButton("##map_canvas", canvas_size);
+
+    if (ImGui::IsItemHovered()) {
+        ImVec2 mouse_pos = ImGui::GetMousePos();
+        float rel_x = mouse_pos.x - canvas_pos.x - map_offset_x;
+        float rel_y = mouse_pos.y - canvas_pos.y - map_offset_y;
+
+        int hover_tile_x = static_cast<int>(rel_x / tile_display_size);
+        int hover_tile_y = static_cast<int>(rel_y / tile_display_size);
+
+        // ЛКМ - работа с маркерами
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (hover_tile_x >= 0 && hover_tile_x < g_TileMap.width &&
+                hover_tile_y >= 0 && hover_tile_y < g_TileMap.height) {
+
+                // Проверяем клик по маркеру
+                ImVec2 world_pos(mouse_pos.x, mouse_pos.y);
+                int marker_id = g_MapView.GetMarkerAtPosition(world_pos, canvas_pos);
+
+                if (marker_id != -1) {
+                    // Выбираем существующий маркер
+                    g_MapView.selected_marker_id = marker_id;
+                    g_MapView.show_marker_editor = true;
+                    con_msgs.push_back("Selected marker: " + g_MapView.markers[marker_id].name);
+                }
+                else {
+                    // Добавляем новый маркер
+                    MapMarker marker;
+                    marker.id = g_MapView.next_marker_id++;
+                    marker.name = "Marker " + std::to_string(marker.id);
+                    marker.world_x = hover_tile_x + 0.5f;
+                    marker.world_y = hover_tile_y + 0.5f;
+
+                    g_MapView.markers[marker.id] = marker;
+                    g_MapView.selected_marker_id = marker.id;
+                    g_MapView.show_marker_editor = true;
+                    g_CurrentProject.is_modified = true;
+
+                    con_msgs.push_back("Added marker at tile: (" +
+                        std::to_string(hover_tile_x) + ", " +
+                        std::to_string(hover_tile_y) + ")");
+                }
+            }
+        }
+
+        // ПКМ - работа с тайлами
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            if (hover_tile_x >= 0 && hover_tile_x < g_TileMap.width &&
+                hover_tile_y >= 0 && hover_tile_y < g_TileMap.height) {
+
+                g_SelectedTileX = hover_tile_x;
+                g_SelectedTileY = hover_tile_y;
+                g_ShowTileEditor = true;
+                ImGui::OpenPopup("TileContextMenu");
+            }
+        }
+
+        // Зум колесиком
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0) {
+            float old_scale = g_MapView.scale;
+            g_MapView.scale *= (wheel > 0) ? 1.2f : 1.0f / 1.2f;
+            g_MapView.scale = std::max(0.1f, std::min(g_MapView.scale, 10.0f));
+        }
+
+        // Панорамирование средней кнопкой
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            if (!g_MapView.is_dragging) {
+                g_MapView.is_dragging = true;
+                g_MapView.drag_start = ImGui::GetMousePos();
+                g_MapView.drag_start_offset = ImVec2(g_MapView.offset_x, g_MapView.offset_y);
+            }
+
+            ImVec2 drag_delta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Middle);
+            g_MapView.offset_x = g_MapView.drag_start_offset.x + drag_delta.x;
+            g_MapView.offset_y = g_MapView.drag_start_offset.y + drag_delta.y;
+        }
+        else {
+            g_MapView.is_dragging = false;
+        }
+    }
+
+    // Контекстное меню для тайла
+    if (ImGui::BeginPopup("TileContextMenu")) {
+        if (g_SelectedTileX >= 0 && g_SelectedTileY >= 0) {
+            Tile& tile = g_TileMap.tiles[g_SelectedTileY][g_SelectedTileX];
+
+            ImGui::Text("Tile (%d, %d)", g_SelectedTileX, g_SelectedTileY);
+            ImGui::Separator();
+
+            if (ImGui::MenuItem("Edit Tile")) {
+                g_ShowTileEditor = true;
+            }
+
+            if (ImGui::MenuItem("Add Marker Here")) {
+                MapMarker marker;
+                marker.id = g_MapView.next_marker_id++;
+                marker.name = "Tile Marker";
+                marker.world_x = g_SelectedTileX + 0.5f;
+                marker.world_y = g_SelectedTileY + 0.5f;
+
+                g_MapView.markers[marker.id] = marker;
+                g_MapView.selected_marker_id = marker.id;
+                g_MapView.show_marker_editor = true;
+                g_CurrentProject.is_modified = true;
+            }
+
+            if (ImGui::MenuItem("Clear Tile")) {
+                tile = Tile();
+                g_CurrentProject.is_modified = true;
+            }
+        }
+        ImGui::EndPopup();
+    }
+
+    // Подсказки управления
+    ImVec2 hint_pos = ImVec2(canvas_pos.x + 10, canvas_pos.y + 10);
+    draw_list->AddRectFilled(hint_pos,
+        ImVec2(hint_pos.x + 200, hint_pos.y + 90),
+        IM_COL32(0, 0, 0, 180));
+
+    draw_list->AddText(hint_pos, IM_COL32(255, 255, 255, 255), "Controls:");
+    draw_list->AddText(ImVec2(hint_pos.x, hint_pos.y + 20),
+        IM_COL32(200, 200, 200, 255),
+        "LMB: Add/Select markers");
+    draw_list->AddText(ImVec2(hint_pos.x, hint_pos.y + 40),
+        IM_COL32(200, 200, 200, 255),
+        "RMB: Select/edit tiles");
+    draw_list->AddText(ImVec2(hint_pos.x, hint_pos.y + 60),
+        IM_COL32(200, 200, 200, 255),
+        "MMB: Pan | Wheel: Zoom");
+
+    ImGui::EndChild();
+}
+
+void DrawRightPanel(const ImVec2& size) {
+    ImGui::BeginChild("right", size, ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoDecoration);
+
+    ImGui::Text("Markers: %zu", g_MapView.markers.size());
+    ImGui::Separator();
+
+    // Кнопка быстрого добавления маркера
+    if (ImGui::Button("Add Marker at Center", ImVec2(-1, 30))) {
+        MapMarker marker;
+        marker.id = g_MapView.next_marker_id++;
+        marker.name = "Center Marker";
+        marker.world_x = g_TileMap.width / 2.0f;
+        marker.world_y = g_TileMap.height / 2.0f;
+
+        g_MapView.markers[marker.id] = marker;
+        g_MapView.selected_marker_id = marker.id;
+        g_MapView.show_marker_editor = true;
+        g_CurrentProject.is_modified = true;
+
+        con_msgs.push_back("Added marker at center");
+    }
+
+    ImGui::Separator();
+
+    // Список маркеров
+    if (ImGui::BeginListBox("##markers_list", ImVec2(-1, size.y - 300))) {
+        for (const auto& pair : g_MapView.markers) {
+            int id = pair.first;
+            const MapMarker& marker = pair.second;
+
+            // Кнопка для каждого маркера
+            std::string button_label = marker.name + "##" + std::to_string(id);
+            if (ImGui::Button(button_label.c_str(), ImVec2(-1, 30))) {
+                g_MapView.selected_marker_id = id;
+                g_MapView.show_marker_editor = true;
+                con_msgs.push_back("Editing: " + marker.name);
+            }
+
+            // Контекстное меню для маркера
+            if (ImGui::BeginPopupContextItem()) {
+                if (ImGui::MenuItem("Edit")) {
+                    g_MapView.selected_marker_id = id;
+                    g_MapView.show_marker_editor = true;
+                }
+                if (ImGui::MenuItem("Duplicate")) {
+                    MapMarker dup = marker;
+                    dup.id = g_MapView.next_marker_id++;
+                    dup.name = marker.name + " (Copy)";
+                    g_MapView.markers[dup.id] = dup;
+                    g_MapView.selected_marker_id = dup.id;
+                    g_MapView.show_marker_editor = true;
+                    g_CurrentProject.is_modified = true;
+                }
+                if (ImGui::MenuItem("Delete")) {
+                    g_MapView.RemoveMarker(id);
+                    g_CurrentProject.is_modified = true;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+        }
+        ImGui::EndListBox();
+    }
+
+    ImGui::Separator();
+
+    // Кнопки управления маркерами
+    if (ImGui::Button("Delete Selected", ImVec2(-1, 30))) {
+        if (g_MapView.selected_marker_id != -1) {
+            g_MapView.RemoveMarker(g_MapView.selected_marker_id);
+            g_CurrentProject.is_modified = true;
+        }
+    }
+
+    if (ImGui::Button("Clear All Markers", ImVec2(-1, 30))) {
+        g_MapView.markers.clear();
+        g_MapView.selected_marker_id = -1;
+        g_MapView.show_marker_editor = false;
+        g_CurrentProject.is_modified = true;
+    }
+
+    ImGui::Separator();
+
+    // Информация о выбранном маркере
+    if (g_MapView.selected_marker_id != -1) {
+        auto it = g_MapView.markers.find(g_MapView.selected_marker_id);
+        if (it != g_MapView.markers.end()) {
+            const MapMarker& marker = it->second;
+
+            ImGui::Text("Selected Marker:");
+            ImGui::Text("Name: %s", marker.name.c_str());
+            ImGui::Text("Position: (%.1f, %.1f)", marker.world_x, marker.world_y);
+            ImGui::Text("Tile: (%d, %d)",
+                static_cast<int>(marker.world_x),
+                static_cast<int>(marker.world_y));
+        }
+    }
+
+    ImGui::EndChild();
+}
+
+void DrawLeftPanel(const ImVec2& size) {
+    ImGui::BeginChild("left", size, ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoDecoration);
+
+    ImGui::Text("Sprites: %zu", g_CurrentProject.loaded_sprites.size());
+    ImGui::Separator();
+
+    // Кнопка загрузки спрайтов
+    if (ImGui::Button("Load Sprites...", ImVec2(-1, 30))) {
+        g_ShowLoadSpritesDialog = true;
+    }
+
+    // Drag & Drop для загрузки файлов
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("DND_FILE")) {
+            const char* filepath = (const char*)payload->Data;
+            try {
+                VulkanTexture texture = LoadTextureFromFile(filepath);
+
+                LeftTextureBrowser sprite;
+                sprite.struct_texture = texture;
+                sprite.name = filepath;
+
+                g_CurrentProject.loaded_sprites.push_back(sprite);
+                imgs.push_back(sprite);
+                g_CurrentProject.is_modified = true;
+
+                con_msgs.push_back("Loaded via drag & drop: " + fs::path(filepath).filename().string());
+
+            }
+            catch (const std::exception& e) {
+                con_msgs.push_back("Failed to load: " + fs::path(filepath).filename().string());
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
+
+    ImGui::Separator();
+
+    // Список загруженных спрайтов
+    if (g_CurrentProject.loaded_sprites.empty()) {
+        ImGui::Text("No sprites loaded");
+        ImGui::Text("Drag & drop image files here");
+        ImGui::Text("or use 'Load Sprites' button");
+    }
+    else {
+        for (const auto& sprite : g_CurrentProject.loaded_sprites) {
+            if (sprite.struct_texture.descriptor_set != VK_NULL_HANDLE) {
+                ImGui::Image(sprite.struct_texture.descriptor_set, ImVec2(64, 64));
+                ImGui::Text("%s", fs::path(sprite.name).filename().string().c_str());
+                ImGui::Separator();
+            }
+        }
+    }
+
+    ImGui::EndChild();
+}
+
+void DrawMainMenuBar() {
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("New Map...", "Ctrl+N")) {
+                g_ShowNewMapDialog = true;
+            }
+
+            ImGui::Separator();
+
+            if (ImGui::MenuItem("Save Map", "Ctrl+S")) {
+                json map_data;
+                map_data["name"] = g_CurrentProject.name;
+                map_data["tilemap_width"] = g_TileMap.width;
+                map_data["tilemap_height"] = g_TileMap.height;
+                map_data["tile_width"] = g_TileMap.tile_width;
+                map_data["tile_height"] = g_TileMap.tile_height;
+                map_data["markers"] = g_MapView.ToJson();
+
+                ImGui::SetClipboardText(map_data.dump(2).c_str());
+                g_CurrentProject.is_modified = false;
+                con_msgs.push_back("Map saved to clipboard");
+            }
+
+            if (ImGui::MenuItem("Load Map", "Ctrl+O")) {
+                const char* clipboard = ImGui::GetClipboardText();
+                if (clipboard) {
+                    try {
+                        json map_data = json::parse(clipboard);
+                        g_CurrentProject.name = map_data.value("name", "Loaded Map");
+                        g_TileMap.width = map_data.value("tilemap_width", 20);
+                        g_TileMap.height = map_data.value("tilemap_height", 15);
+                        g_TileMap.tile_width = map_data.value("tile_width", 32);
+                        g_TileMap.tile_height = map_data.value("tile_height", 32);
+                        g_MapView.FromJson(map_data["markers"]);
+
+                        con_msgs.push_back("Map loaded from clipboard");
+                    }
+                    catch (const json::parse_error&) {
+                        con_msgs.push_back("Error parsing map data");
+                    }
+                }
+            }
+
+            ImGui::Separator();
+
+            if (ImGui::MenuItem("Exit", "Alt+F4")) {
+                SDL_Event quit_event;
+                quit_event.type = SDL_QUIT;
+                SDL_PushEvent(&quit_event);
+            }
+
+            ImGui::EndMenu();
+        }
+
+        if (ImGui::BeginMenu("Edit")) {
+            if (ImGui::MenuItem("Tile Editor", "T", g_ShowTileEditor)) {
+                g_ShowTileEditor = !g_ShowTileEditor;
+            }
+
+            if (ImGui::MenuItem("Marker Editor", "M", g_MapView.show_marker_editor)) {
+                g_MapView.show_marker_editor = !g_MapView.show_marker_editor;
+            }
+
+            ImGui::EndMenu();
+        }
+
+        if (ImGui::BeginMenu("Sprites")) {
+            if (ImGui::MenuItem("Load Sprites...", "Ctrl+I")) {
+                g_ShowLoadSpritesDialog = true;
+            }
+
+            if (ImGui::MenuItem("Clear All Sprites")) {
+                for (auto& sprite : g_CurrentProject.loaded_sprites) {
+                    DestroyTexture(sprite.struct_texture);
+                }
+                g_CurrentProject.loaded_sprites.clear();
+                imgs.clear();
+                con_msgs.push_back("All sprites cleared");
+            }
+
+            ImGui::EndMenu();
+        }
+
+        ImGui::EndMainMenuBar();
+    }
+}
+
+void mein(int w, int h) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(io.DisplaySize);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->WorkPos, ImGuiCond_Always);
+
+    ImGui::Begin("mein", nullptr, ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoDecoration);
+
+    DrawMainMenuBar();
+
+    // Левая панель (1/4 ширины) - спрайты
+    DrawLeftPanel(ImVec2(w * 0.23, h - 20));
+
+    ImGui::SameLine();
+
+    // Центральная панель (1/2 ширины) - карта
+    DrawMapWindow(ImVec2(w * 0.54, h - 20));
+
+    ImGui::SameLine();
+
+    // Правая панель (1/4 ширины) - маркеры
+    DrawRightPanel(ImVec2(w * 0.23, h - 20));
+
+    // Диалоговые окна
+    ShowNewMapDialog();
+    ShowLoadTileImageDialog();
+    ShowLoadSpritesDialog();
+    ShowTileEditor();
+    ShowMarkerEditor();
+
+    ImGui::End();
+}
+
+// ==================== ОСНОВНЫЕ ФУНКЦИИ VULKAN ====================
+
+#ifdef APP_USE_VULKAN_DEBUG_REPORT
+static VkDebugReportCallbackEXT g_DebugReport = VK_NULL_HANDLE;
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL debug_report(VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT objectType, uint64_t object, size_t location, int32_t messageCode, const char* pLayerPrefix, const char* pMessage, void* pUserData) {
+    (void)flags; (void)object; (void)location; (void)messageCode; (void)pUserData; (void)pLayerPrefix;
+    fprintf(stderr, "[vulkan] Debug report from ObjectType: %i\nMessage: %s\n\n", objectType, pMessage);
+    return VK_FALSE;
+}
+#endif
+
+static bool IsExtensionAvailable(const ImVector<VkExtensionProperties>& properties, const char* extension) {
+    for (const VkExtensionProperties& p : properties)
+        if (strcmp(p.extensionName, extension) == 0)
+            return true;
+    return false;
+}
+
+static void SetupVulkan(ImVector<const char*> instance_extensions) {
+    VkResult err;
+#ifdef IMGUI_IMPL_VULKAN_USE_VOLK
+    volkInitialize();
+#endif
+
+    // Create Vulkan Instance
+    {
+        VkInstanceCreateInfo create_info = {};
+        create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+
+        // Enumerate available extensions
+        uint32_t properties_count;
+        ImVector<VkExtensionProperties> properties;
+        vkEnumerateInstanceExtensionProperties(nullptr, &properties_count, nullptr);
+        properties.resize(properties_count);
+        err = vkEnumerateInstanceExtensionProperties(nullptr, &properties_count, properties.Data);
+        check_vk_result(err);
+
+        // Enable required extensions
+        if (IsExtensionAvailable(properties, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
+            instance_extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+#ifdef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
+        if (IsExtensionAvailable(properties, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
+        {
+            instance_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
+#endif
+
+        // Enabling validation layers
+#ifdef APP_USE_VULKAN_DEBUG_REPORT
+        const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
+        create_info.enabledLayerCount = 1;
+        create_info.ppEnabledLayerNames = layers;
+        instance_extensions.push_back("VK_EXT_debug_report");
+#endif
+
+        // Create Vulkan Instance
+        create_info.enabledExtensionCount = (uint32_t)instance_extensions.Size;
+        create_info.ppEnabledExtensionNames = instance_extensions.Data;
+        err = vkCreateInstance(&create_info, g_Allocator, &g_Instance);
+        check_vk_result(err);
+#ifdef IMGUI_IMPL_VULKAN_USE_VOLK
+        volkLoadInstance(g_Instance);
+#endif
+
+#ifdef APP_USE_VULKAN_DEBUG_REPORT
+        auto f_vkCreateDebugReportCallbackEXT = (PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(g_Instance, "vkCreateDebugReportCallbackEXT");
+        IM_ASSERT(f_vkCreateDebugReportCallbackEXT != nullptr);
+        VkDebugReportCallbackCreateInfoEXT debug_report_ci = {};
+        debug_report_ci.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT;
+        debug_report_ci.flags = VK_DEBUG_REPORT_ERROR_BIT_EXT | VK_DEBUG_REPORT_WARNING_BIT_EXT | VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT;
+        debug_report_ci.pfnCallback = debug_report;
+        debug_report_ci.pUserData = nullptr;
+        err = f_vkCreateDebugReportCallbackEXT(g_Instance, &debug_report_ci, g_Allocator, &g_DebugReport);
+        check_vk_result(err);
+#endif
+    }
+
+    // Select Physical Device
+    g_PhysicalDevice = ImGui_ImplVulkanH_SelectPhysicalDevice(g_Instance);
+    IM_ASSERT(g_PhysicalDevice != VK_NULL_HANDLE);
+
+    // Select graphics queue family
+    g_QueueFamily = ImGui_ImplVulkanH_SelectQueueFamilyIndex(g_PhysicalDevice);
+    IM_ASSERT(g_QueueFamily != (uint32_t)-1);
+
+    // Create Logical Device
+    {
+        ImVector<const char*> device_extensions;
+        device_extensions.push_back("VK_KHR_swapchain");
+
+        // Enumerate physical device extension
+        uint32_t properties_count;
+        ImVector<VkExtensionProperties> properties;
+        vkEnumerateDeviceExtensionProperties(g_PhysicalDevice, nullptr, &properties_count, nullptr);
+        properties.resize(properties_count);
+        vkEnumerateDeviceExtensionProperties(g_PhysicalDevice, nullptr, &properties_count, properties.Data);
+#ifdef VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME
+        if (IsExtensionAvailable(properties, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME))
+            device_extensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+#endif
+
+        const float queue_priority[] = { 1.0f };
+        VkDeviceQueueCreateInfo queue_info[1] = {};
+        queue_info[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queue_info[0].queueFamilyIndex = g_QueueFamily;
+        queue_info[0].queueCount = 1;
+        queue_info[0].pQueuePriorities = queue_priority;
+        VkDeviceCreateInfo create_info = {};
+        create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        create_info.queueCreateInfoCount = sizeof(queue_info) / sizeof(queue_info[0]);
+        create_info.pQueueCreateInfos = queue_info;
+        create_info.enabledExtensionCount = (uint32_t)device_extensions.Size;
+        create_info.ppEnabledExtensionNames = device_extensions.Data;
+        err = vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &g_Device);
+        check_vk_result(err);
+        vkGetDeviceQueue(g_Device, g_QueueFamily, 0, &g_Queue);
+    }
+
+    // Create Descriptor Pool
+    {
+        VkDescriptorPoolSize pool_sizes[] =
+        {
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, IMGUI_IMPL_VULKAN_MINIMUM_IMAGE_SAMPLER_POOL_SIZE },
+        };
+        VkDescriptorPoolCreateInfo pool_info = {};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        pool_info.maxSets = 0;
+        for (VkDescriptorPoolSize& pool_size : pool_sizes)
+            pool_info.maxSets += pool_size.descriptorCount;
+        pool_info.poolSizeCount = (uint32_t)IM_ARRAYSIZE(pool_sizes);
+        pool_info.pPoolSizes = pool_sizes;
+        err = vkCreateDescriptorPool(g_Device, &pool_info, g_Allocator, &g_DescriptorPool);
+        check_vk_result(err);
+    }
+}
+
+static void SetupVulkanWindow(ImGui_ImplVulkanH_Window* wd, VkSurfaceKHR surface, int width, int height) {
+    wd->Surface = surface;
+
+    // Check for WSI support
+    VkBool32 res;
+    vkGetPhysicalDeviceSurfaceSupportKHR(g_PhysicalDevice, g_QueueFamily, wd->Surface, &res);
+    if (res != VK_TRUE) {
+        fprintf(stderr, "Error no WSI support on physical device 0\n");
+        exit(-1);
+    }
+
+    // Select Surface Format
+    const VkFormat requestSurfaceImageFormat[] = { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8_UNORM, VK_FORMAT_R8G8B8_UNORM };
+    const VkColorSpaceKHR requestSurfaceColorSpace = VK_COLORSPACE_SRGB_NONLINEAR_KHR;
+    wd->SurfaceFormat = ImGui_ImplVulkanH_SelectSurfaceFormat(g_PhysicalDevice, wd->Surface, requestSurfaceImageFormat, (size_t)IM_ARRAYSIZE(requestSurfaceImageFormat), requestSurfaceColorSpace);
+
+    // Select Present Mode
+#ifdef APP_USE_UNLIMITED_FRAME_RATE
+    VkPresentModeKHR present_modes[] = { VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_KHR };
+#else
+    VkPresentModeKHR present_modes[] = { VK_PRESENT_MODE_FIFO_KHR };
+#endif
+    wd->PresentMode = ImGui_ImplVulkanH_SelectPresentMode(g_PhysicalDevice, wd->Surface, &present_modes[0], IM_ARRAYSIZE(present_modes));
+
+    // Create SwapChain, RenderPass, Framebuffer, etc.
+    IM_ASSERT(g_MinImageCount >= 2);
+    ImGui_ImplVulkanH_CreateOrResizeWindow(g_Instance, g_PhysicalDevice, g_Device, wd, g_QueueFamily, g_Allocator, width, height, g_MinImageCount, 0);
+}
+
+static void CleanupVulkan() {
+    vkDestroyDescriptorPool(g_Device, g_DescriptorPool, g_Allocator);
+
+#ifdef APP_USE_VULKAN_DEBUG_REPORT
+    auto f_vkDestroyDebugReportCallbackEXT = (PFN_vkDestroyDebugReportCallbackEXT)vkGetInstanceProcAddr(g_Instance, "vkDestroyDebugReportCallbackEXT");
+    f_vkDestroyDebugReportCallbackEXT(g_Instance, g_DebugReport, g_Allocator);
+#endif
+
+    vkDestroyDevice(g_Device, g_Allocator);
+    vkDestroyInstance(g_Instance, g_Allocator);
+}
+
+static void CleanupVulkanWindow() {
+    ImGui_ImplVulkanH_DestroyWindow(g_Instance, g_Device, &g_MainWindowData, g_Allocator);
+}
+
+static void FrameRender(ImGui_ImplVulkanH_Window* wd, ImDrawData* draw_data) {
+    VkSemaphore image_acquired_semaphore = wd->FrameSemaphores[wd->SemaphoreIndex].ImageAcquiredSemaphore;
+    VkSemaphore render_complete_semaphore = wd->FrameSemaphores[wd->SemaphoreIndex].RenderCompleteSemaphore;
+    VkResult err = vkAcquireNextImageKHR(g_Device, wd->Swapchain, UINT64_MAX, image_acquired_semaphore, VK_NULL_HANDLE, &wd->FrameIndex);
+    if (err == VK_ERROR_OUT_OF_DATE_KHR || err == VK_SUBOPTIMAL_KHR)
+        g_SwapChainRebuild = true;
+    if (err == VK_ERROR_OUT_OF_DATE_KHR)
+        return;
+    if (err != VK_SUBOPTIMAL_KHR)
+        check_vk_result(err);
+
+    ImGui_ImplVulkanH_Frame* fd = &wd->Frames[wd->FrameIndex];
+    {
+        err = vkWaitForFences(g_Device, 1, &fd->Fence, VK_TRUE, UINT64_MAX);
+        check_vk_result(err);
+
+        err = vkResetFences(g_Device, 1, &fd->Fence);
+        check_vk_result(err);
+    }
+    {
+        err = vkResetCommandPool(g_Device, fd->CommandPool, 0);
+        check_vk_result(err);
+        VkCommandBufferBeginInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        err = vkBeginCommandBuffer(fd->CommandBuffer, &info);
+        check_vk_result(err);
+    }
+    {
+        VkRenderPassBeginInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        info.renderPass = wd->RenderPass;
+        info.framebuffer = fd->Framebuffer;
+        info.renderArea.extent.width = wd->Width;
+        info.renderArea.extent.height = wd->Height;
+        info.clearValueCount = 1;
+        info.pClearValues = &wd->ClearValue;
+        vkCmdBeginRenderPass(fd->CommandBuffer, &info, VK_SUBPASS_CONTENTS_INLINE);
+    }
+
+    // Record dear imgui primitives into command buffer
+    ImGui_ImplVulkan_RenderDrawData(draw_data, fd->CommandBuffer);
+
+    // Submit command buffer
+    vkCmdEndRenderPass(fd->CommandBuffer);
+    {
+        VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        info.waitSemaphoreCount = 1;
+        info.pWaitSemaphores = &image_acquired_semaphore;
+        info.pWaitDstStageMask = &wait_stage;
+        info.commandBufferCount = 1;
+        info.pCommandBuffers = &fd->CommandBuffer;
+        info.signalSemaphoreCount = 1;
+        info.pSignalSemaphores = &render_complete_semaphore;
+
+        err = vkEndCommandBuffer(fd->CommandBuffer);
+        check_vk_result(err);
+        err = vkQueueSubmit(g_Queue, 1, &info, fd->Fence);
+        check_vk_result(err);
+    }
+}
+
+static void FramePresent(ImGui_ImplVulkanH_Window* wd) {
+    if (g_SwapChainRebuild)
+        return;
+    VkSemaphore render_complete_semaphore = wd->FrameSemaphores[wd->SemaphoreIndex].RenderCompleteSemaphore;
+    VkPresentInfoKHR info = {};
+    info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    info.waitSemaphoreCount = 1;
+    info.pWaitSemaphores = &render_complete_semaphore;
+    info.swapchainCount = 1;
+    info.pSwapchains = &wd->Swapchain;
+    info.pImageIndices = &wd->FrameIndex;
+    VkResult err = vkQueuePresentKHR(g_Queue, &info);
+    if (err == VK_ERROR_OUT_OF_DATE_KHR || err == VK_SUBOPTIMAL_KHR)
+        g_SwapChainRebuild = true;
+    if (err == VK_ERROR_OUT_OF_DATE_KHR)
+        return;
+    if (err != VK_SUBOPTIMAL_KHR)
+        check_vk_result(err);
+    wd->SemaphoreIndex = (wd->SemaphoreIndex + 1) % wd->SemaphoreCount;
+}
+
+// ==================== MAIN FUNCTION ====================
+
+int main() {
+#ifdef _WIN32
+    SetProcessDPIAware();
+#endif
+
+    // Setup SDL
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) {
+        printf("Error: %s\n", SDL_GetError());
+        return 1;
+    }
+
+#ifdef SDL_HINT_IME_SHOW_UI
+    SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
+#endif
+
+    // Create window
+    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    SDL_Window* window = SDL_CreateWindow("Map Editor", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1920, 1080, window_flags);
+    if (window == nullptr) {
+        printf("Error: SDL_CreateWindow(): %s\n", SDL_GetError());
+        return 1;
+    }
+
+    // Setup Vulkan
+    ImVector<const char*> extensions;
+    uint32_t extensions_count = 0;
+    SDL_Vulkan_GetInstanceExtensions(window, &extensions_count, nullptr);
+    extensions.resize(extensions_count);
+    SDL_Vulkan_GetInstanceExtensions(window, &extensions_count, extensions.Data);
+    SetupVulkan(extensions);
+
+    // Create Window Surface
+    VkSurfaceKHR surface;
+    VkResult err;
+    if (SDL_Vulkan_CreateSurface(window, g_Instance, &surface) == 0) {
+        printf("Failed to create Vulkan surface.\n");
+        return 1;
+    }
+
+    // Create Framebuffers
+    int w, h;
+    SDL_GetWindowSize(window, &w, &h);
+    ImGui_ImplVulkanH_Window* wd = &g_MainWindowData;
+    SetupVulkanWindow(wd, surface, w, h);
+
+    // Setup Dear ImGui context
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+
+    // Setup style
+    ImGui::StyleColorsDark();
+
+    // Setup Platform/Renderer backends
+    ImGui_ImplSDL2_InitForVulkan(window);
+    ImGui_ImplVulkan_InitInfo init_info = {};
+    init_info.Instance = g_Instance;
+    init_info.PhysicalDevice = g_PhysicalDevice;
+    init_info.Device = g_Device;
+    init_info.QueueFamily = g_QueueFamily;
+    init_info.Queue = g_Queue;
+    init_info.PipelineCache = g_PipelineCache;
+    init_info.DescriptorPool = g_DescriptorPool;
+    init_info.MinImageCount = g_MinImageCount;
+    init_info.ImageCount = wd->ImageCount;
+    init_info.Allocator = g_Allocator;
+    init_info.PipelineInfoMain.RenderPass = wd->RenderPass;
+    init_info.PipelineInfoMain.Subpass = 0;
+    init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    init_info.CheckVkResultFn = check_vk_result;
+    ImGui_ImplVulkan_Init(&init_info);
+
+    // Load default font
+    io.Fonts->AddFontDefault();
+
+    // Enable drag and drop
+    SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+
+    // Main loop
+    bool done = false;
+    ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
+
+    while (!done) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            ImGui_ImplSDL2_ProcessEvent(&event);
+
+            if (event.type == SDL_QUIT)
+                done = true;
+            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE && event.window.windowID == SDL_GetWindowID(window))
+                done = true;
+
+            // Обработка drag & drop файлов
+            if (event.type == SDL_DROPFILE) {
+                char* dropped_file = event.drop.file;
+                std::string filepath(dropped_file);
+                std::string extension = filepath.substr(filepath.find_last_of(".") + 1);
+                std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+
+                std::vector<std::string> image_extensions = { "png", "jpg", "jpeg", "bmp", "tga" };
+
+                if (std::find(image_extensions.begin(), image_extensions.end(), extension) != image_extensions.end()) {
+                    try {
+                        VulkanTexture texture = LoadTextureFromFile(dropped_file);
+
+                        LeftTextureBrowser sprite;
+                        sprite.struct_texture = texture;
+                        sprite.name = dropped_file;
+
+                        g_CurrentProject.loaded_sprites.push_back(sprite);
+                        imgs.push_back(sprite);
+                        g_CurrentProject.is_modified = true;
+
+                        con_msgs.push_back("Dropped file: " + fs::path(filepath).filename().string());
+
+                    }
+                    catch (const std::exception& e) {
+                        con_msgs.push_back("Failed to load: " + fs::path(filepath).filename().string());
+                    }
+                }
+
+                SDL_free(dropped_file);
+            }
+        }
+
+        // Resize swap chain if needed
+        int fb_width, fb_height;
+        SDL_GetWindowSize(window, &fb_width, &fb_height);
+        if (fb_width > 0 && fb_height > 0 && (g_SwapChainRebuild || g_MainWindowData.Width != fb_width || g_MainWindowData.Height != fb_height)) {
+            ImGui_ImplVulkan_SetMinImageCount(g_MinImageCount);
+            ImGui_ImplVulkanH_CreateOrResizeWindow(g_Instance, g_PhysicalDevice, g_Device, wd, g_QueueFamily, g_Allocator, fb_width, fb_height, g_MinImageCount, 0);
+            g_MainWindowData.FrameIndex = 0;
+            g_SwapChainRebuild = false;
+        }
+
+        // Start the Dear ImGui frame
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplSDL2_NewFrame();
+        ImGui::NewFrame();
+
+        // Отрисовка основного интерфейса
+        {
+            SDL_GetWindowSize(window, &w, &h);
+            mein(w, h);
+        }
+
+        // Rendering
+        ImGui::Render();
+        ImDrawData* draw_data = ImGui::GetDrawData();
+        const bool is_minimized = (draw_data->DisplaySize.x <= 0.0f || draw_data->DisplaySize.y <= 0.0f);
+        if (!is_minimized) {
+            wd->ClearValue.color.float32[0] = clear_color.x * clear_color.w;
+            wd->ClearValue.color.float32[1] = clear_color.y * clear_color.w;
+            wd->ClearValue.color.float32[2] = clear_color.z * clear_color.w;
+            wd->ClearValue.color.float32[3] = clear_color.w;
+            FrameRender(wd, draw_data);
+            FramePresent(wd);
+        }
+    }
+
+    // Cleanup
+    err = vkDeviceWaitIdle(g_Device);
+    check_vk_result(err);
+
+    // Уничтожение текстур
+    for (auto& sprite : g_CurrentProject.loaded_sprites) {
+        DestroyTexture(sprite.struct_texture);
+    }
+    for (auto& tile : g_TileSet.tiles) {
+        DestroyTexture(tile.struct_texture);
+    }
+    for (auto& img : imgs) {
+        DestroyTexture(img.struct_texture);
+    }
+
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplSDL2_Shutdown();
+    ImGui::DestroyContext();
+
+    CleanupVulkanWindow();
+    CleanupVulkan();
+
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+
+    return 0;
+}

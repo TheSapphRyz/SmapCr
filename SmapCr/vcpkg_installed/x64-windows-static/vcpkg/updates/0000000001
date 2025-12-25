@@ -1,0 +1,7 @@
+Package: raygui
+Version: 4.0
+Architecture: x64-windows-static
+Multi-Arch: same
+Abi: 1b132e62b9a5850fe8db6bec136502343569b213d7ca1060cbb89608e4e42bf8
+Description: A simple and easy-to-use immediate-mode gui library
+Status: install ok installed

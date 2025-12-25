@@ -1,0 +1,110 @@
+{
+  "$schema": "https://raw.githubusercontent.com/spdx/spdx-spec/v2.2.1/schemas/spdx-schema.json",
+  "spdxVersion": "SPDX-2.2",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "documentNamespace": "https://spdx.org/spdxdocs/cgltf-x64-windows-static-1.14-402578d6-a1e6-4865-884d-3ea65db152cc",
+  "name": "cgltf:x64-windows-static@1.14 f2890b238b526e0b22ec037036f846f4c380baba276b4190898f617a11b9315b",
+  "creationInfo": {
+    "creators": [
+      "Tool: vcpkg-2024-12-09-1005b78fa1bf1dde1a20c2734cba4ea61ca94d9a"
+    ],
+    "created": "2025-12-24T11:07:02Z"
+  },
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-port",
+      "relationshipType": "GENERATES",
+      "relatedSpdxElement": "SPDXRef-binary"
+    },
+    {
+      "spdxElementId": "SPDXRef-port",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-file-0"
+    },
+    {
+      "spdxElementId": "SPDXRef-port",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-file-1"
+    },
+    {
+      "spdxElementId": "SPDXRef-binary",
+      "relationshipType": "GENERATED_FROM",
+      "relatedSpdxElement": "SPDXRef-port"
+    },
+    {
+      "spdxElementId": "SPDXRef-file-0",
+      "relationshipType": "CONTAINED_BY",
+      "relatedSpdxElement": "SPDXRef-port"
+    },
+    {
+      "spdxElementId": "SPDXRef-file-1",
+      "relationshipType": "CONTAINED_BY",
+      "relatedSpdxElement": "SPDXRef-port"
+    }
+  ],
+  "packages": [
+    {
+      "name": "cgltf",
+      "SPDXID": "SPDXRef-port",
+      "versionInfo": "1.14",
+      "downloadLocation": "git+https://github.com/Microsoft/vcpkg#ports/cgltf",
+      "homepage": "https://github.com/jkuhlmann/cgltf",
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "description": "Single-file glTF 2.0 loader and writer written in C99",
+      "comment": "This is the port (recipe) consumed by vcpkg."
+    },
+    {
+      "name": "cgltf:x64-windows-static",
+      "SPDXID": "SPDXRef-binary",
+      "versionInfo": "f2890b238b526e0b22ec037036f846f4c380baba276b4190898f617a11b9315b",
+      "downloadLocation": "NONE",
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "comment": "This is a binary package built by vcpkg."
+    },
+    {
+      "SPDXID": "SPDXRef-resource-0",
+      "name": "jkuhlmann/cgltf",
+      "downloadLocation": "git+https://github.com/jkuhlmann/cgltf@v1.14",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "checksums": [
+        {
+          "algorithm": "SHA512",
+          "checksumValue": "1f0e7dca353f1fca94f5936519895d59d4d2a3a1204545bf5420ff130c1d168158be4749010b2016c127ac9216929892f093ca10b5753fa622bea629aa3f194a"
+        }
+      ]
+    }
+  ],
+  "files": [
+    {
+      "fileName": "./C:/Users/sapph1ren/vcpkg/ports/cgltf/portfile.cmake",
+      "SPDXID": "SPDXRef-file-0",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "43608ccf64fd9740d44e4dd59af18315ca7aa1bc8839291bfd5c28a7f12e338b"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "fileName": "./C:/Users/sapph1ren/vcpkg/ports/cgltf/vcpkg.json",
+      "SPDXID": "SPDXRef-file-1",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "75245c98366143eb8966162d4eb573640fbf866e36e1de7333c5966e3c7d9206"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "copyrightText": "NOASSERTION"
+    }
+  ]
+}
