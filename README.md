@@ -1,4 +1,4 @@
-# SmapCr
+# S-maps
 ## What is this?
 A small initial map editor project for my game and future **game engine**. Supports both orthogonal and isometric editing of isometric maps.
 The following libraries were used:
