@@ -9,7 +9,7 @@ The following libraries were used:
 
 [nfd](https://github.com/btzy/nativefiledialog-extended)
 
-[zvec](https://github.com/Zuhaitz-dev/zvec.h)(if he ll add C++ support)
+[zvec](https://github.com/Zuhaitz-dev/zvec.h)
 
 ## What's next?
 - more functionality
