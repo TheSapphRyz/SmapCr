@@ -628,13 +628,11 @@ int main() {
 
             GuiLabel({ 20, 160, 230, 20 }, TextFormat("Current: %s", toolNames[currentTool]));
 
-            // Изометрический вид
             if (GuiToggle({ 20, 185, 20, 20 }, NULL, &isIsometric)) {
                 isIsometric = !isIsometric;
             }
             GuiLabel({ 45, 185, 200, 20 }, "Isometric View");
 
-            // Привязка к сетке
             if (GuiToggle({ 20, 210, 20, 20 }, NULL, &snapToGrid)) {
                 snapToGrid = !snapToGrid;
             }
