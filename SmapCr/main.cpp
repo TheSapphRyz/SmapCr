@@ -1,4 +1,4 @@
-#define _CRT_SECURE_NO_WARNINGS
+﻿#define _CRT_SECURE_NO_WARNINGS
 #define RAYGUI_IMPLEMENTATION
 #define GRAPHICS_API_VULKAN
 #include <raylib.h>
@@ -56,6 +56,28 @@ int sc_idx;
 int act_idx;
 int foc_idx;
 
+struct generator_set {
+	// 1. Общий масштаб (насколько всё крупное: и горы, и равнины)
+	float gen_frequency = 0.05f;  // Чем меньше, тем больше объекты
+
+	// 2. Интенсивность высот (насколько горы высокие)
+	float gen_amplitude = 15.0f;
+
+	// 3. Порог гор (при каком значении биома начинаются горы)
+	float gen_mountain_cutoff = 0.7f;
+
+	// 4. Кривизна (экспонента для холмов, делает их пологими или резкими)
+	float gen_hill_exp = 2.0f;
+
+	// 5. Сила искривления рек (насколько они "пьяные")
+	float gen_river_warp = 10.0f;
+	float gen_scale = 0.02f;      // Масштаб всего (меньше = больше объектов)
+	float gen_roughness = 0.5f;   // Насколько поверхность "шершавая"
+	float gen_lacunarity = 2.0f;  // Детализация между слоями
+	float gen_distort = 4.0f;     // Сила искривления (убирает параллельность)
+	float gen_octaves = 4;
+};
+generator_set g_set;
 float GetVertexHeight(int x, int z) {
 	if (x < 0 || x >= MAP_W || z < 0 || z >= MAP_H) return 0.0f;
 	return (float)tiles[z * MAP_W + x].h;
@@ -73,9 +95,20 @@ float GetInterpolatedHeight(float x, float z) {
 	float lerpBottom = h01 + sx * (h11 - h01);
 	return lerpTop + sz * (lerpBottom - lerpTop);
 }
-void DrawMap() {
-	for (int z = 0; z < MAP_H - 1; z++) {
-		for (int x = 0; x < MAP_W - 1; x++) {
+void DrawMap(Camera3D camera) {
+	int viewDist = (int)(camera.fovy * 1.5f);
+
+	int startX = (int)camera.target.x - viewDist;
+	int endX = (int)camera.target.x + viewDist;
+	int startZ = (int)camera.target.z - viewDist;
+	int endZ = (int)camera.target.z + viewDist;
+	startX = std::max(0, startX);
+	endX = std::min(MAP_W - 1, endX);
+	startZ = std::max(0, startZ);
+	endZ = std::min(MAP_H - 1, endZ);
+
+	for (int z = startZ; z < endZ; z++) {
+		for (int x = startX; x < endX; x++) {
 			int idx = z * MAP_W + x;
 			Tile& t = tiles[idx];
 			float h00 = GetVertexHeight(x, z);        
@@ -83,7 +116,7 @@ void DrawMap() {
 			float h11 = GetVertexHeight(x + 1, z + 1); 
 			float h01 = GetVertexHeight(x, z + 1);    
 			Texture2D texture = { 0 };
-			auto it = texs.find(t.tid);
+			auto it = texs.find(t.tid);	
 			if (it != texs.end()) texture = it->second.first;
 			rlSetTexture(texture.id);
 			rlBegin(RL_QUADS);
@@ -110,11 +143,8 @@ float rnd_seed() {
 	return dist(rng);
 }
 
-
-
 float get_noise(float x, float z) {
-
-	float h = sin(x * PI + z - seed) * PI + cos(seed);
+	float h = std::sin(x * 12.9898f + z * 78.233f + seed) * PI;
 	return h - std::floor(h);
 }
 float smooth_noise(float x, float z) {
@@ -131,31 +161,85 @@ float smooth_noise(float x, float z) {
 		ux * uz * get_noise(ix + 1.0f, iz + 1.0f);
 	return res;
 }
+float fbm(float x, float z) {
+	float total = 0.0f;
+	float amplitude = 1.0f;
+	float freq = g_set.gen_scale;
+
+	for (int i = 0; i < g_set.gen_octaves; i++) {
+		total += smooth_noise(x * freq, z * freq) * amplitude;
+		amplitude *= g_set.gen_roughness;
+		freq *= g_set.gen_lacunarity;
+	}
+	return total;
+}
+float warped_noise(float x, float z) {
+	// Мы создаем смещение координат с помощью самого шума
+	float offsetX = fbm(x + 0.0f, z + 0.0f) * g_set.gen_distort;
+	float offsetZ = fbm(x + 5.2f, z + 1.3f) * g_set.gen_distort;
+
+	// Рисуем шум уже по смещенным координатам
+	return fbm(x + offsetX, z + offsetZ);
+}
+// Функция для плавного смешивания двух значений (можно добавить smoothstep для лучшего вида)
+float smooth_lerp(float a, float b, float t) {
+	// Используем smoothstep (опционально)
+	t = t * t * (3.0f - 2.0f * t);
+	return a + t * (b - a);
+}
+
 
 void gen_l() {
 	seed = rnd_seed();
+	// Глобальный уровень моря
+	const float SEA_LEVEL = 0.5f;
+
 	for (int i = 0; i < MAP_W * MAP_H; i++) {
-		int x = i % MAP_W;
-		int z = i / MAP_W;
-		float biome = smooth_noise(x * 0.05f, z * 0.05f);
+		float x = (float)(i % MAP_W);
+		float z = (float)(i / MAP_W);
+
+		// Используем старый шум (пока вы не перешли на Perlin/stb_perlin)
+		float n = warped_noise(x, z);
+		float biome = smooth_noise(x * 0.01f, z * 0.01f + seed * 0.1f);
+
+		// 1. Вычисляем потенциальные высоты для каждого биома
+		float h_plains = n * 2.0f;
+
+		// Внимание: ваш шум возвращает [0, 1], но abs(n - 0.5) даст [0, 0.5]
+		float h_river = h_plains - 6.0f;
+
+		float h_hills = std::pow(n, g_set.gen_hill_exp) * (g_set.gen_amplitude * 0.5f);
+
+		float ridge = 1.0f - std::abs(n * 2.0f - 1.0f); // Range [0, 1]
+		float h_mounts = ridge * g_set.gen_amplitude;
 
 		float finalHeight = 0.0f;
-		if (biome < 0.4f) finalHeight = smooth_noise(x * 0.1f, z * 0.1f) * 2.0f;
-		else if (biome < 0.07) {
-			float riverWarpX = smooth_noise(x * 0.03f, z * 0.03f) * 10.0f; // Сильное искривление
-			float riverWarpZ = smooth_noise(z * 0.03f, x * 0.03f) * 10.0f;
-			float river = std::abs(smooth_noise((x + riverWarpX) * 0.06f, (z + riverWarpZ) * 0.06f) - 0.5f);		if (river < 0.05f) finalHeight -= 5.0f;
-		}
-		else if (biome < 0.7f) {
-			float h = smooth_noise(x * 0.1f, z * 0.1f);
-			finalHeight = std::pow(h, 2.0f) * 8.0f;
+
+		// 2. Плавное смешивание биомов
+		// Мы используем 3 основных зоны смешивания: Равнины-Холмы, Холмы-Горы
+
+		if (biome < 0.3f) {
+			// Переход от Равнин к Холмам
+			float t = (biome - 0.08f) / (0.3f - 0.08f); // Нормализуем 't'
+			finalHeight = smooth_lerp(h_plains, h_hills, t);
 		}
 		else {
-			float h = 1.0f - std::abs(smooth_noise(x * 0.15f, z * 0.15f) * 2.0f - 1.2f);
-			finalHeight = h * 15.0f;
+			// Переход от Холмов к Горам
+			float t = (biome - 0.3f) / (g_set.gen_mountain_cutoff - 0.3f);
+			finalHeight = smooth_lerp(h_hills, h_mounts, t);
 		}
-		
-		tiles[i] = { i, 0, "default", finalHeight, json::object() };
+
+		// 3. Отдельная логика для рек (прорезаем их в уже смешанном ландшафте)
+		float riverLine = std::abs(n - 0.5f);
+		if (riverLine < 0.04f) {
+			// Используем lerp, чтобы края реки были пологими, а не резкими
+			float river_t = riverLine / 0.04f; // t от 0 (центр реки) до 1 (край)
+			finalHeight = smooth_lerp(h_river, finalHeight, river_t);
+		}
+
+		tiles[i].h = finalHeight;
+		// Все, что ниже уровня моря - вода
+		tiles[i].tid = (finalHeight < SEA_LEVEL) ? "water" : "grass";
 	}
 }
 
@@ -205,25 +289,34 @@ int main() {
 				camera.target = Vector3Add(camera.target, upMove);
 			}
 		}
-		camera.fovy = std::clamp(camera.fovy - GetMouseWheelMove() * 2.0f, 2.0f, 100.0f);
+		camera.fovy = std::clamp(camera.fovy - GetMouseWheelMove() * 2.0f, 2.0f, 1000.0f);
 		 
 
 		BeginDrawing();
 		BeginMode3D(camera);
 		ClearBackground(SKYBLUE);
 		// тут рисовка
-		DrawMap();
+		DrawMap(camera);
 
 		EndMode3D();
-
-		//GuiPanel({ 10.0f, 10.0f, ws.x*0.1f, ws.y*0.26f}, "TOOLS");
-		//printf("%f  %f", ws.x, ws.y);
 		GuiToggleGroup({ 10.0f, 10.0f, ws.x * 0.1f, ws.y * 0.03f }, "TILE;OBJ;SLCT", &tool_s);
 		if (GuiButton({ 10.0f, 50.0f, ws.x * 0.05f, ws.y * 0.03f }, "Generate")) gen_l();
 		if (GuiButton({ 10.0f, 90.0f, ws.x * 0.05f, ws.y * 0.03f }, "Load height map"));
+		GuiSlider({ 10.0f, 130.0f, ws.x * 0.05f, ws.y * 0.03f }, "", "", &g_set.gen_amplitude, 1.0f, 100.0f);
+		GuiSlider({ 10.0f, 170.0f, ws.x * 0.05f, ws.y * 0.03f }, "", "", &g_set.gen_distort, 1.0f, 100.0f);
+		GuiSlider({ 10.0f, 210.0f, ws.x * 0.05f, ws.y * 0.03f }, "", "", &g_set.gen_frequency, 0.00001f, 0.1f);
+		GuiSlider({ 10.0f, 250.0f, ws.x * 0.05f, ws.y * 0.03f }, "", "", &g_set.gen_hill_exp, 1.0f, 100.0f);
+		GuiSlider({ 10.0f, 290.0f, ws.x * 0.05f, ws.y * 0.03f }, "", "", &g_set.gen_lacunarity, 1.0f, 100.0f);
+		GuiSlider({ 10.0f, 330.0f, ws.x * 0.05f, ws.y * 0.03f }, "", "", &g_set.gen_mountain_cutoff, 0.01f, 0.7f);
+		GuiSlider({ 10.0f, 370.0f, ws.x * 0.05f, ws.y * 0.03f }, "", "", &g_set.gen_octaves, 1.0f, 100.0f);
+		GuiSlider({ 10.0f, 410.0f, ws.x * 0.05f, ws.y * 0.03f }, "", "", &g_set.gen_river_warp, 1.0f, 100.0f);
+		GuiSlider({ 10.0f, 450.0f, ws.x * 0.05f, ws.y * 0.03f }, "", "", &g_set.gen_roughness, 0.01f, 1.0f);
+		GuiSlider({ 10.0f, 490.0f, ws.x * 0.05f, ws.y * 0.03f }, "", "", &g_set.gen_scale, 0.000001f, 1.0f);
 		GuiPanel({ ws.x - ws.x * 0.1f, 10.0f, ws.x * 0.1f, ws.y * 0.3f }, "Textures");
 		if (GuiButton({ ws.x - ws.x * 0.1f + 1.0f, 30.0f, ws.x * 0.1f - 1.0f, ws.y * 0.03f }, "Load texture"));
 		GuiListViewEx({ ws.x - ws.x * 0.1f + 1.0f, 70.0f, ws.x * 0.1f - 1.0f, ws.y * 0.26f }, texs_for_list.data(), texs_for_list.size(), &sc_idx, &act_idx, &foc_idx);
+
+
 
 		EndDrawing();
 	}
